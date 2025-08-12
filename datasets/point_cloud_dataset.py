@@ -1,8 +1,10 @@
+# point_cloud_dataset.py
 import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 import torch.nn.functional as F
+
 class PointCloudDataset(Dataset):
     def __init__(self, root_dir, split="train", transform=None, max_points=20000):
         self.root_dir = os.path.join(root_dir, split)
@@ -31,6 +33,7 @@ class PointCloudDataset(Dataset):
         points = np.load(os.path.join(scene_path, "coord.npy"))  # (N, 3)
         labels = np.load(os.path.join(scene_path, "segment20.npy"))  # (N,)
 
+        # 如果点云数据过多，进行采样
         if len(points) > self.max_points:
             indices = np.random.choice(len(points), self.max_points, replace=False)
             points = points[indices]
@@ -40,14 +43,17 @@ class PointCloudDataset(Dataset):
             points = np.pad(points, ((0, pad_size), (0, 0)), mode='constant')
             labels = np.pad(labels, (0, pad_size), mode='constant', constant_values=-1)
 
+        # 确保每个点的特征有 9 维（坐标 + 颜色 + 法线）
         points = torch.from_numpy(np.concatenate([points, np.zeros_like(points), np.zeros_like(points)], axis=-1)).float()
         labels = torch.from_numpy(labels).long()
+
+        if self.transform:
+            points, labels = self.transform(points, labels)
 
         return points, labels
 
     def __len__(self):
         return len(self.scene_list)
-
 
 class PointCloudTransform:
     """点云数据增强变换（优化版）"""

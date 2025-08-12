@@ -163,7 +163,6 @@ class Trainer:
 
         print(f"训练轮次 {epoch}：损失 = {epoch_loss:.4f}, 准确率 = {epoch_acc:.4f}")
         return epoch_loss, epoch_acc
-
     def validate(self, epoch):
         """验证模型性能（优化索引安全和效率）"""
         self.model.eval()
