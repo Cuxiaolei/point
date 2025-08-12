@@ -82,6 +82,11 @@ class PointCloudDataset(Dataset):
         print(f"[PointCloudDataset] Final points shape: {points.shape}, labels shape: {labels.shape}")
         return points, labels
 
+
+    def __len__(self):
+        return len(self.scene_list)
+
+
 class PointCloudTransform:
     """点云数据增强变换（优化版）"""
 
