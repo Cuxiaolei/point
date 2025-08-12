@@ -9,7 +9,7 @@ from sklearn.metrics import confusion_matrix
 import torch.cuda.amp  # 引入混合精度训练
 import torch.cuda.amp as amp  # 使用 torch.amp 进行混合精度训练
 from torch.amp import GradScaler, autocast
-
+# kkk是大傻逼
 
 class Trainer:
     """模型训练器，优化后解决索引越界问题并提升内存效率"""
