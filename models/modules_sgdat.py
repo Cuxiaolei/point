@@ -1,9 +1,6 @@
-# modules_sgdat.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-
 
 def pairwise_distance(a, b):
     """计算点云之间的平方欧氏距离"""
@@ -12,27 +9,15 @@ def pairwise_distance(a, b):
     inner = torch.bmm(a, b.transpose(1, 2))  # (B, M, N)
     return a_sq + b_sq - 2 * inner
 
-
-# modules_sgdat.py
-
 def safe_knn_idx(dist, radius, num_neighbors, num_points):
-    """
-    计算 KNN 索引时，确保索引不越界。
-    """
-    # 将 radius 转换为张量（如果它是一个 float 类型）
+    """计算 KNN 索引时，确保索引不越界。"""
     radius = torch.tensor(radius, device=dist.device)  # 确保 radius 是 tensor 类型
-
     mask = dist <= radius.unsqueeze(-1)  # (B, M, N)
     masked_dist = dist.clone()
     masked_dist[~mask] = float('inf')  # 非有效索引处设置为无穷大
-
-    # 对掩码后的距离进行排序
     _, knn_idx = torch.topk(masked_dist, k=num_neighbors, dim=-1, largest=False)
-
-    # 检查并确保索引不超过点云的最大数量
     knn_idx = knn_idx.clamp(max=num_points - 1)
     return knn_idx
-
 
 class DynamicRadiusChannelFusion(nn.Module):
     def __init__(self, in_channels, out_channels, num_neighbors=32, min_radius=0.05, max_radius=0.3):
@@ -67,11 +52,14 @@ class DynamicRadiusChannelFusion(nn.Module):
         dist2 = pairwise_distance(centers, points).clamp(min=0)
         dist = torch.sqrt(dist2 + 1e-8)
 
-        # 获取点云的数量（即 N）
-        num_points = points.shape[1]
+        # 打印每一步的维度以调试
+        print(f"[DynamicRadiusChannelFusion] centers shape: {centers.shape}")  # (B, M, 3)
+        print(f"[DynamicRadiusChannelFusion] dist shape: {dist.shape}")  # (B, M, N)
 
         # 计算有效邻域索引
-        knn_idx = safe_knn_idx(dist, self.max_radius, self.num_neighbors, num_points)
+        knn_idx = safe_knn_idx(dist, self.max_radius, self.num_neighbors, N)
+
+        print(f"[DynamicRadiusChannelFusion] knn_idx shape: {knn_idx.shape}")  # (B, M, num_neighbors)
 
         # 获取邻域特征
         batch_inds = torch.arange(B, device=points.device).view(B, 1, 1).repeat(1, M, self.num_neighbors)
@@ -91,7 +79,8 @@ class DynamicRadiusChannelFusion(nn.Module):
         # 融合中心特征
         fused = fused_nei + centers_feats  # (B, M, C)
         out = self.mlp(fused)  # (B, M, out_ch)
-        return out, knn_idx  # 返回 knn_idx 便于可视化或上采样
+        print(f"[DynamicRadiusChannelFusion] out shape: {out.shape}")  # 打印输出的维度
+        return out, knn_idx
 
 
 class ChannelCCC(nn.Module):
