@@ -14,7 +14,8 @@ def main():
         NUM_CLASSES=13,  # 根据实际数据集调整
         BATCH_SIZE=1,
         MAX_EPOCHS=100,
-        LEARNING_RATE=1e-3
+        LEARNING_RATE=1e-3,
+        MAX_POINTS=8000  # 修改为合适的最大点数
     )
 
     # 初始化数据增强

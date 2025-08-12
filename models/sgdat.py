@@ -3,22 +3,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .modules_sgdat import DynamicRadiusChannelFusion, ChannelCCC, LinearSpatialGVA
-
 class SGDATSeg(nn.Module):
-    """
-    Semantic-Guided Dynamic Aggregation Transformer for point cloud segmentation.
-    输入: points (B,N,3) 或 (B,N,3+feat)
-    输出: logits (B,N,num_classes)
-    """
-    def __init__(self, num_classes=13, input_dim=3, base_dim=64, max_points=8000):
+    def __init__(self, num_classes=13, input_dim=6, base_dim=64, max_points=8000):
         super().__init__()
         self.num_classes = num_classes
         self.input_dim = input_dim
         self.base_dim = base_dim
 
-        # 初始编码
+        # 初始编码：input_dim = 6 (3 + 3)，表示包含坐标和附加的特征（如颜色、法线）
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, base_dim),
+            nn.Linear(input_dim, base_dim),  # 输入维度调整为 input_dim
             nn.ReLU(),
             nn.Linear(base_dim, base_dim)
         )
@@ -54,8 +48,9 @@ class SGDATSeg(nn.Module):
         )
 
     def forward(self, x):
+        print(f"Input data shape: {x.shape}")  # 打印输入数据的形状
         B, N, _ = x.shape
-        coords = x[..., :3]
+        coords = x[..., :3]  # 坐标部分 (B, N, 3)
 
         feats = self.encoder(x)  # (B,N,base_dim)
 

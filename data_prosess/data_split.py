@@ -2,7 +2,7 @@ import os
 import random
 import shutil
 import numpy as np
-import torch
+
 
 def scale_point_cloud(coords, target_range=(-1, 1)):
     """将点云坐标缩放到指定范围"""
@@ -115,28 +115,6 @@ def main():
     print(f"训练集路径: {train_output}")
     print(f"验证集路径: {val_output}")
     print(f"点云坐标已缩放到 {target_range} 范围")
-
-
-def preprocess_point_cloud(point_cloud, color=None, normal=None, max_points=8000):
-    # 如果点云数量超过 max_points，进行下采样
-    num_points = point_cloud.shape[0]
-    if num_points > max_points:
-        # 使用随机选择的方式进行下采样
-        selected_indices = torch.randperm(num_points)[:max_points]
-        point_cloud = point_cloud[selected_indices]
-        if color is not None:
-            color = color[selected_indices]
-        if normal is not None:
-            normal = normal[selected_indices]
-    elif num_points < max_points:
-        # 如果点云数量少于 max_points，进行零填充
-        padding = max_points - num_points
-        point_cloud = torch.cat([point_cloud, torch.zeros(padding, 3)], dim=0)
-        if color is not None:
-            color = torch.cat([color, torch.zeros(padding, 3)], dim=0)
-        if normal is not None:
-            normal = torch.cat([normal, torch.zeros(padding, 3)], dim=0)
-    return point_cloud, color, normal
 
 
 if __name__ == "__main__":

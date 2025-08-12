@@ -8,6 +8,7 @@ from tqdm import tqdm
 from sklearn.metrics import confusion_matrix
 import torch.cuda.amp  # 引入混合精度训练
 import torch.cuda.amp as amp  # 使用 torch.amp 进行混合精度训练
+from torch.amp import GradScaler, autocast
 
 
 class Trainer:
@@ -19,7 +20,7 @@ class Trainer:
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.device = config.DEVICE
-        self.scaler = amp.GradScaler()  # 使用 GradScaler 进行混合精度训练
+        self.scaler = GradScaler() if self.device == 'cuda' else None  # 使用新的GradScaler API
 
         # 核心优化1：确保collate与数据集max_points同步，避免重复填充
         self.max_points = getattr(train_dataset, 'max_points', 20000)  # 从数据集获取最大点数
@@ -100,32 +101,20 @@ class Trainer:
         config.print_config()
 
     def train_epoch(self, epoch):
-        """训练一个轮次（优化内存和稳定性）"""
         self.model.train()
         total_loss = 0.0
         total_correct = 0
         total_points = 0
 
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.config.MAX_EPOCHS}")
-
-        for batch_idx, (points, labels) in enumerate(pbar):
-            # 移动数据到设备（确保与模型同设备）
+        for batch_idx, (points, labels) in enumerate(self.train_loader):
             points = points.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
 
-            # 核心优化3：检查数据有效性（避免空批次或异常形状）
-            if points.shape[0] == 0:
-                print(f"警告：第{epoch}轮第{batch_idx}批次为空，已跳过")
-                continue
-
-            # 前向传播和计算损失
             self.optimizer.zero_grad()
 
-            # 混合精度训练上下文
-            with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+            with autocast(device_type='cuda', enabled=self.scaler is not None):  # 使用新的autocast API
                 loss, logits = self.model.get_loss(points, labels, ignore_index=-1)
 
-            # 反向传播（混合精度缩放）
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
                 self.scaler.step(self.optimizer)

@@ -7,23 +7,11 @@ import torch.nn.functional as F
 
 class PointCloudDataset(Dataset):
     """点云数据集加载器（优化版）"""
-
     def __init__(self, root_dir, split="train", transform=None, max_points=20000):
-        """
-        Args:
-            root_dir: 数据集根目录
-            split: 数据集分割类型 ("train" 或 "val")
-            transform: 数据增强变换
-            max_points: 单一场景的最大点数量（核心优化）
-        """
         self.root_dir = os.path.join(root_dir, split)
         self.transform = transform
         self.max_points = max_points  # 限制单场景最大点数，解决内存溢出
         self.scene_list = self._get_scene_list()
-
-        # 打印数据集信息
-        print(f"加载 {split} 数据集: {self.root_dir}")
-        print(f"包含 {len(self.scene_list)} 个场景，最大点数限制: {max_points}")
 
     def _get_scene_list(self):
         """获取场景列表，过滤无效场景"""
@@ -54,68 +42,55 @@ class PointCloudDataset(Dataset):
         points = np.load(os.path.join(scene_path, "coord.npy"))  # (N, 3)
         labels = np.load(os.path.join(scene_path, "segment20.npy"))  # (N,)
 
-        # 核心优化1：限制最大点数（超过则下采样，不足则补零）
-        if len(points) > self.max_points:
-            # 随机下采样（保留均匀分布的点）
-            indices = np.random.choice(len(points), self.max_points, replace=False)
-            points = points[indices]
-            labels = labels[indices]
-        elif len(points) < self.max_points:
-            # 不足则补零（保持批次形状一致，避免动态形状）
-            pad_size = self.max_points - len(points)
-            points = np.pad(points, ((0, pad_size), (0, 0)), mode='constant')
-            labels = np.pad(labels, (0, pad_size), mode='constant', constant_values=-1)  # 用-1标记无效点
-
-        # 可选：加载颜色和法向量特征（如果有）
-        features = []
-        # 加载颜色特征（严格检查点数一致性）
+        # 确保颜色和法向量与点云数量一致
         if os.path.exists(os.path.join(scene_path, "color.npy")):
             colors = np.load(os.path.join(scene_path, "color.npy"))
-            # 强制检查：颜色点数必须与点云点数一致，否则丢弃
             if len(colors) != len(points):
-                print(
-                    f"警告：场景 {scene_path} 的color.npy点数与点云不一致（{len(colors)} vs {len(points)}），已丢弃颜色特征")
-            else:
-                # 同步下采样/补零
-                if len(points) > self.max_points and indices is not None:
-                    colors = colors[indices]
-                elif len(points) < self.max_points:
-                    colors = np.pad(colors, ((0, pad_size), (0, 0)), mode='constant')
-                features.append(colors)
+                # 填充或裁剪颜色特征
+                if len(colors) > len(points):
+                    colors = colors[:len(points)]
+                else:
+                    colors = np.pad(colors, ((0, len(points) - len(colors)), (0, 0)), mode='constant')
+        else:
+            colors = np.zeros_like(points)  # 默认颜色
 
-        # 加载法向量特征（同上检查）
         if os.path.exists(os.path.join(scene_path, "normal.npy")):
             normals = np.load(os.path.join(scene_path, "normal.npy"))
             if len(normals) != len(points):
-                print(
-                    f"警告：场景 {scene_path} 的normal.npy点数与点云不一致（{len(normals)} vs {len(points)}），已丢弃法向量特征")
-            else:
-                # 同步下采样/补零
-                if len(points) > self.max_points and indices is not None:
-                    normals = normals[indices]
-                elif len(points) < self.max_points:
-                    normals = np.pad(normals, ((0, pad_size), (0, 0)), mode='constant')
-                features.append(normals)
+                # 填充或裁剪法向量
+                if len(normals) > len(points):
+                    normals = normals[:len(points)]
+                else:
+                    normals = np.pad(normals, ((0, len(points) - len(normals)), (0, 0)), mode='constant')
+        else:
+            normals = np.zeros_like(points)  # 默认法向量
+
+        # 核心优化1：限制最大点数（超过则下采样，不足则补零）
+        if len(points) > self.max_points:
+            indices = np.random.choice(len(points), self.max_points, replace=False)
+            points = points[indices]
+            labels = labels[indices]
+            colors = colors[indices]
+            normals = normals[indices]
+        elif len(points) < self.max_points:
+            pad_size = self.max_points - len(points)
+            points = np.pad(points, ((0, pad_size), (0, 0)), mode='constant')
+            labels = np.pad(labels, (0, pad_size), mode='constant', constant_values=-1)
+            colors = np.pad(colors, ((0, pad_size), (0, 0)), mode='constant')
+            normals = np.pad(normals, ((0, pad_size), (0, 0)), mode='constant')
 
         # 合并特征（如果有）
-        if features:
-            points = np.concatenate([points] + features, axis=-1)  # (N, 3 + C)
-
-        # 转换为张量
-        points = torch.from_numpy(points).float()
+        points = torch.from_numpy(np.concatenate([points, colors, normals], axis=-1)).float()
         labels = torch.from_numpy(labels).long()
 
-        # 应用数据增强（优化：只对有效点增强）
         if self.transform:
-            # 分离有效点和无效点（补零的部分不参与增强）
+            # 应用数据增强（只对有效点增强）
             valid_mask = labels != -1
             valid_points = points[valid_mask]
             valid_labels = labels[valid_mask]
 
-            # 只对有效点进行增强
             valid_points, valid_labels = self.transform(valid_points, valid_labels)
 
-            # 重建完整点云和标签
             points[valid_mask] = valid_points
             labels[valid_mask] = valid_labels
 

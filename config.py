@@ -7,7 +7,7 @@ class Config:
     """模型训练和评估的配置参数（Linux系统适配版）"""
 
     # 数据集配置（Linux路径格式，使用/分隔）
-    DATA_ROOT = "./data/tower"  # 划分后的数据集根目录（根据实际路径调整）
+    DATA_ROOT = "/root/my/Point++/data/tower"  # 划分后的数据集根目录（根据实际路径调整）
     TRAIN_DIR = os.path.join(DATA_ROOT, "train")  # 训练集目录
     VAL_DIR = os.path.join(DATA_ROOT, "val")  # 验证集目录
     NUM_CLASSES = 13  # 类别数量（根据实际数据集调整）
