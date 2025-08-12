@@ -31,6 +31,7 @@ def safe_knn_idx(dist, radius, num_neighbors, num_points):
     knn_idx = knn_idx.clamp(max=num_points - 1)
     return knn_idx
 
+
 class DynamicRadiusChannelFusion(nn.Module):
     def __init__(self, in_channels, out_channels, num_neighbors=32, min_radius=0.05, max_radius=0.3):
         super().__init__()
@@ -64,16 +65,8 @@ class DynamicRadiusChannelFusion(nn.Module):
         dist2 = pairwise_distance(centers, points).clamp(min=0)
         dist = torch.sqrt(dist2 + 1e-8)
 
-        # 打印每一步的维度以调试
-        print(f"[DynamicRadiusChannelFusion] centers shape: {centers.shape}")  # (B, M, 3)
-        print(f"[DynamicRadiusChannelFusion] dist shape: {dist.shape}")  # (B, M, N)
-
-        # 计算有效邻域索引
-        knn_idx = safe_knn_idx(dist, self.max_radius, self.num_neighbors, N)
-
-        # 确保 knn_idx 的维度正确
-        print(f"[DynamicRadiusChannelFusion] knn_idx shape: {knn_idx.shape}")
-        print(f"[DynamicRadiusChannelFusion] knn_idx: {knn_idx[0]}")  # 打印第一个样本的 knn_idx
+        # 获取邻域索引
+        knn_idx = self.get_knn(dist, N)
 
         # 获取邻域特征
         batch_inds = torch.arange(B, device=points.device).view(B, 1, 1).repeat(1, M, self.num_neighbors)
@@ -93,8 +86,13 @@ class DynamicRadiusChannelFusion(nn.Module):
         # 融合中心特征
         fused = fused_nei + centers_feats  # (B, M, C)
         out = self.mlp(fused)  # (B, M, out_ch)
-        print(f"[DynamicRadiusChannelFusion] out shape: {out.shape}")  # 打印输出的维度
         return out, knn_idx
+
+    def get_knn(self, dist, N):
+        """计算 KNN 索引，避免邻域为空"""
+        dist[dist == 0] = float('inf')  # 避免距离为零导致无效邻域
+        _, knn_idx = dist.topk(self.num_neighbors, dim=-1, largest=False)
+        return knn_idx
 
 
 class ChannelCCC(nn.Module):
