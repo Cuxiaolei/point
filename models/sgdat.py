@@ -4,20 +4,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .modules_sgdat import DynamicRadiusChannelFusion, ChannelCCC, LinearSpatialGVA
 class SGDATSeg(nn.Module):
-    def __init__(self, num_classes=13, input_dim=6, base_dim=64, max_points=8000):
+    def __init__(self, num_classes=13, input_dim=9, base_dim=64, max_points=8000):  # 修改为9
         super().__init__()
         self.num_classes = num_classes
-        self.input_dim = input_dim
+        self.input_dim = input_dim  # 使用9个特征
         self.base_dim = base_dim
 
-        # 初始编码：input_dim = 6 (3 + 3)，表示包含坐标和附加的特征（如颜色、法线）
+        # 初始编码：input_dim = 9 (3 + 3 + 3)，表示包含坐标、颜色和法向量
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, base_dim),  # 输入维度调整为 input_dim
+            nn.Linear(input_dim, base_dim),  # 输入维度调整为 9
             nn.ReLU(),
             nn.Linear(base_dim, base_dim)
         )
 
-        # 两级动态融合下采样
         self.fuse1 = DynamicRadiusChannelFusion(in_channels=base_dim, out_channels=base_dim, num_neighbors=32, min_radius=0.02, max_radius=0.15)
         self.fuse2 = DynamicRadiusChannelFusion(in_channels=base_dim, out_channels=base_dim, num_neighbors=32, min_radius=0.05, max_radius=0.3)
 
@@ -29,23 +28,21 @@ class SGDATSeg(nn.Module):
             nn.Softmax(dim=-1)
         )
 
-        # 使用 ChannelCCC 和 LinearSpatialGVA
-        self.channel_ccc = ChannelCCC(dim=base_dim)  # 用于特征通道加权
-        self.linear_gva = LinearSpatialGVA(dim=base_dim)  # 用于空间聚合
+        self.channel_ccc = ChannelCCC(dim=base_dim)
+        self.linear_gva = LinearSpatialGVA(dim=base_dim)
 
-        # 上采样融合
         self.up_mlp = nn.Sequential(
             nn.Linear(base_dim * 3, base_dim),
             nn.ReLU(),
             nn.Linear(base_dim, base_dim)
         )
 
-        # 最终分类头
         self.classifier = nn.Sequential(
             nn.Linear(base_dim, base_dim//2),
             nn.ReLU(),
             nn.Linear(base_dim//2, num_classes)
         )
+
 
     def forward(self, x):
         print(f"Input data shape: {x.shape}")  # 打印输入数据的形状

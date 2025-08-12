@@ -9,13 +9,25 @@ def pairwise_distance(a, b):
     inner = torch.bmm(a, b.transpose(1, 2))  # (B, M, N)
     return a_sq + b_sq - 2 * inner
 
+
 def safe_knn_idx(dist, radius, num_neighbors, num_points):
     """计算 KNN 索引时，确保索引不越界。"""
     radius = torch.tensor(radius, device=dist.device)  # 确保 radius 是 tensor 类型
     mask = dist <= radius.unsqueeze(-1)  # (B, M, N)
     masked_dist = dist.clone()
     masked_dist[~mask] = float('inf')  # 非有效索引处设置为无穷大
+
+    # 打印调试信息
+    print(f"[safe_knn_idx] dist min: {dist.min()}, dist max: {dist.max()}")
+    print(f"[safe_knn_idx] masked_dist min: {masked_dist.min()}, masked_dist max: {masked_dist.max()}")
+
     _, knn_idx = torch.topk(masked_dist, k=num_neighbors, dim=-1, largest=False)
+
+    # 打印 knn_idx 的值和维度
+    print(f"[safe_knn_idx] knn_idx shape: {knn_idx.shape}")
+    print(f"[safe_knn_idx] knn_idx: {knn_idx[0]}")  # 打印第一个样本的 knn_idx
+
+    # 确保索引不超出维度
     knn_idx = knn_idx.clamp(max=num_points - 1)
     return knn_idx
 
@@ -59,7 +71,9 @@ class DynamicRadiusChannelFusion(nn.Module):
         # 计算有效邻域索引
         knn_idx = safe_knn_idx(dist, self.max_radius, self.num_neighbors, N)
 
-        print(f"[DynamicRadiusChannelFusion] knn_idx shape: {knn_idx.shape}")  # (B, M, num_neighbors)
+        # 确保 knn_idx 的维度正确
+        print(f"[DynamicRadiusChannelFusion] knn_idx shape: {knn_idx.shape}")
+        print(f"[DynamicRadiusChannelFusion] knn_idx: {knn_idx[0]}")  # 打印第一个样本的 knn_idx
 
         # 获取邻域特征
         batch_inds = torch.arange(B, device=points.device).view(B, 1, 1).repeat(1, M, self.num_neighbors)
