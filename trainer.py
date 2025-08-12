@@ -134,7 +134,7 @@ class Trainer:
 
             self.optimizer.zero_grad()
             # forward + loss (with AMP)
-            with autocast(enabled=self.scaler is not None):
+            with autocast(device_type='cuda', enabled=self.scaler is not None):
                 loss, logits = self.model.get_loss(points, labels, ignore_index=-1, class_weights=self.class_weights)
 
             # numeric check
@@ -216,7 +216,7 @@ class Trainer:
                     pbar.set_postfix({"val_loss": "N/A", "val_acc": "N/A", "有效点": 0})
                     continue
 
-                with autocast(enabled=self.scaler is not None):
+                with autocast(device_type='cuda', enabled=self.scaler is not None):
                     loss, logits = self.model.get_loss(points, labels, ignore_index=-1, class_weights=self.class_weights)
 
                 preds = logits.argmax(dim=-1)
