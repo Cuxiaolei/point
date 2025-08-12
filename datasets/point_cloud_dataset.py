@@ -81,3 +81,79 @@ class PointCloudDataset(Dataset):
 
         print(f"[PointCloudDataset] Final points shape: {points.shape}, labels shape: {labels.shape}")
         return points, labels
+
+class PointCloudTransform:
+    """点云数据增强变换（优化版）"""
+
+    def __init__(self, rotation=True, scale=True, noise=True, translate=True):
+        self.rotation = rotation
+        self.scale = scale
+        self.noise = noise
+        self.translate = translate
+
+    def __call__(self, points, labels):
+        """
+        对输入点云进行数据增强（只处理有效点）
+
+        Args:
+            points: (N, 3 + C) 点云坐标和特征（仅有效点）
+            labels: (N,) 点云标签（仅有效点）
+
+        Returns:
+            增强后的点云和标签
+        """
+        if len(points) == 0:  # 避免空场景报错
+            return points, labels
+
+        # 分离坐标和特征
+        coords = points[:, :3]
+        features = points[:, 3:] if points.shape[1] > 3 else None
+
+        # 随机旋转（只旋转坐标）
+        if self.rotation:
+            coords = self._random_rotation(coords)
+
+        # 随机缩放
+        if self.scale:
+            coords = self._random_scale(coords)
+
+        # 随机平移（优化：缩小平移范围，避免过度偏移）
+        if self.translate:
+            coords = self._random_translate(coords)
+
+        # 添加高斯噪声（优化：降低噪声幅度）
+        if self.noise:
+            coords = self._add_noise(coords)
+
+        # 重新组合坐标和特征
+        if features is not None:
+            points = torch.cat([coords, features], dim=-1)
+        else:
+            points = coords
+
+        return points, labels
+
+    def _random_rotation(self, coords):
+        """绕Z轴随机旋转（优化：限制旋转角度范围）"""
+        angle = torch.rand(1) * np.pi / 3 - np.pi / 6  # 限制在±30度，避免过度旋转
+        rot_matrix = torch.tensor([
+            [torch.cos(angle), -torch.sin(angle), 0],
+            [torch.sin(angle), torch.cos(angle), 0],
+            [0, 0, 1]
+        ], dtype=coords.dtype)
+        return coords @ rot_matrix
+
+    def _random_scale(self, coords):
+        """随机缩放（保持原有逻辑）"""
+        scale = torch.rand(1) * 0.4 + 0.8  # 0.8-1.2之间的随机缩放因子
+        return coords * scale
+
+    def _random_translate(self, coords):
+        """随机平移（优化：缩小平移范围）"""
+        translate = torch.randn(3) * 0.03  # 从0.05缩小到0.03，减少偏移量
+        return coords + translate
+
+    def _add_noise(self, coords):
+        """添加高斯噪声（优化：降低噪声幅度）"""
+        noise = torch.randn_like(coords) * 0.0005  # 从0.001减半，减少噪声影响
+        return coords + noise
