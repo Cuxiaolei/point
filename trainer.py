@@ -1,3 +1,4 @@
+# trainer.py
 import os
 import torch
 import torch.optim as optim
@@ -105,7 +106,10 @@ class Trainer:
         total_correct = 0
         total_points = 0
 
-        for batch_idx, (points, labels) in enumerate(self.train_loader):
+        # 初始化 tqdm 进度条
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.config.MAX_EPOCHS}")
+
+        for batch_idx, (points, labels) in enumerate(pbar):
             points = points.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
 
@@ -134,19 +138,17 @@ class Trainer:
             total_points += mask.sum().item()
             total_loss += loss.item()
 
-            # 打印批次信息
-            if batch_idx % self.config.LOG_FREQ == 0:
-                batch_acc = correct / mask.sum().item()
-                pbar.set_postfix({
-                    "loss": f"{loss.item():.4f}",
-                    "acc": f"{batch_acc:.4f}",
-                    "有效点": f"{mask.sum().item()}"  # 新增：显示有效点数量，帮助调试
-                })
+            # 更新进度条
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "acc": f"{correct / mask.sum().item():.4f}",
+                "有效点": f"{mask.sum().item()}"
+            })
 
-                # 写入TensorBoard
-                global_step = epoch * len(self.train_loader) + batch_idx
-                self.writer.add_scalar("train/batch_loss", loss.item(), global_step)
-                self.writer.add_scalar("train/batch_acc", batch_acc, global_step)
+            # 写入TensorBoard
+            global_step = epoch * len(self.train_loader) + batch_idx
+            self.writer.add_scalar("train/batch_loss", loss.item(), global_step)
+            self.writer.add_scalar("train/batch_acc", correct / mask.sum().item(), global_step)
 
             # 核心优化4：及时清理内存
             del points, labels, loss, logits, preds, mask
@@ -163,6 +165,7 @@ class Trainer:
 
         print(f"训练轮次 {epoch}：损失 = {epoch_loss:.4f}, 准确率 = {epoch_acc:.4f}")
         return epoch_loss, epoch_acc
+
     def validate(self, epoch):
         """验证模型性能（优化索引安全和效率）"""
         self.model.eval()
