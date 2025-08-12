@@ -7,16 +7,34 @@ from datasets.point_cloud_dataset import PointCloudDataset, PointCloudTransform
 from trainer import Trainer
 from config import Config
 
+# main.py - 在创建 dataset 后，设置 config.NUM_CLASSES
+import numpy as np
+import os
+import numpy as np, os, collections
+
+def infer_num_classes(data_root):
+    labels_set = set()
+    for split in ['train', 'val']:
+        split_dir = os.path.join(data_root, split)
+        if not os.path.isdir(split_dir):
+            continue
+        for scene in os.listdir(split_dir):
+            seg_path = os.path.join(split_dir, scene, 'segment20.npy')
+            if os.path.exists(seg_path):
+                arr = np.load(seg_path)
+                labels_set.update(np.unique(arr).tolist())
+    # 忽略 pad label -1
+    labels = [int(x) for x in labels_set if int(x) >= 0]
+    if not labels:
+        return 1
+    return max(labels) + 1
+
 
 def main():
+
+
     # 加载配置
-    config = Config(
-        NUM_CLASSES=13,  # 根据实际数据集调整
-        BATCH_SIZE=1,
-        MAX_EPOCHS=100,
-        LEARNING_RATE=1e-3,
-        MAX_POINTS=8000  # 修改为合适的最大点数
-    )
+    config = Config()
 
     # 初始化数据增强
     transform = PointCloudTransform(
@@ -41,6 +59,10 @@ def main():
         max_points=config.MAX_POINTS  # 使用配置中的点数
     )
 
+    num_classes = infer_num_classes(config.DATA_ROOT)
+    print(f"[INFO] Inferred num_classes = {num_classes}")
+    config.NUM_CLASSES = num_classes
+
     # 初始化DAT模型
     # model = DATSeg(num_classes=config.NUM_CLASSES)
 
@@ -53,6 +75,16 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"模型总参数: {total_params:,}")
     print(f"可训练参数: {trainable_params:,}")
+
+    cnt = collections.Counter()
+    for scene in train_dataset.scene_list:
+        arr = np.load(os.path.join(scene, 'segment20.npy'))
+        vals = arr.flatten()
+        vals = vals[vals != -1]
+        cnt.update(map(int, vals.tolist()))
+    print("[Label distribution] (label: count)")
+    for k, v in sorted(cnt.items()):
+        print(k, v)
 
     # 初始化训练器并开始训练
     trainer = Trainer(model, config, train_dataset, val_dataset)

@@ -238,22 +238,28 @@ class Trainer:
                 if self.device == 'cuda':
                     torch.cuda.empty_cache()
 
-        # 计算mIoU（处理可能的零分母）
+        # trainer.py - 在 validate 计算 ious 部分，改为只对有样本类别求平均
         ious = []
+        present_classes = []
         for cls in range(self.config.NUM_CLASSES):
-            tp = conf_matrix[cls, cls]
-            fp = conf_matrix[:, cls].sum() - tp
-            fn = conf_matrix[cls, :].sum() - tp
-
-            # 避免除以零（当该类别无样本时）
-            if tp + fp + fn == 0:
-                iou = 0.0
+            tp = int(conf_matrix[cls, cls])
+            fp = int(conf_matrix[:, cls].sum()) - tp
+            fn = int(conf_matrix[cls, :].sum()) - tp
+            denom = tp + fp + fn
+            if denom > 0:
+                iou = tp / denom
+                ious.append(iou)
+                present_classes.append(cls)
             else:
-                iou = tp / (tp + fp + fn)
-            ious.append(iou)
-            self.writer.add_scalar(f"val/iou_{cls}", iou, epoch)
+                # skip classes that do not appear in GT
+                pass
 
-        miou = np.mean(ious) if ious else 0.0
+        miou = float(np.mean(ious)) if len(ious) > 0 else 0.0
+
+        # 打印每个存在类的 IoU，帮助诊断
+        for cls_idx, i in zip(present_classes, ious):
+            self.writer.add_scalar(f"val/iou_{cls_idx}", i, epoch)
+            print(f"[IoU] class {cls_idx}: {i:.4f}")
 
         # 计算整体指标
         val_loss = total_loss / len(self.val_loader) if len(self.val_loader) > 0 else 0
