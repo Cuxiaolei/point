@@ -45,7 +45,8 @@ def main():
     # model = DATSeg(num_classes=config.NUM_CLASSES)
 
     # 初始化SGDAT模型
-    model = SGDATSeg(num_classes=config.NUM_CLASSES)
+    model = SGDATSeg(num_classes=config.NUM_CLASSES, input_dim=9, base_dim=64, max_points=config.MAX_POINTS, debug=True)
+
 
     # 打印模型参数数量
     total_params = sum(p.numel() for p in model.parameters())
