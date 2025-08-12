@@ -68,6 +68,9 @@ class PointCloudDataset(Dataset):
         points = torch.from_numpy(np.concatenate([points, colors, normals], axis=-1)).float()
         labels = torch.from_numpy(labels).long()
 
+        # 输出加载后的特征维度
+        print(f"[PointCloudDataset] Final points shape: {points.shape}, labels shape: {labels.shape}")
+
         # 如果有数据增强操作，则应用
         if self.transform:
             valid_mask = labels != -1
@@ -79,7 +82,6 @@ class PointCloudDataset(Dataset):
             points[valid_mask] = valid_points
             labels[valid_mask] = valid_labels
 
-        print(f"[PointCloudDataset] Final points shape: {points.shape}, labels shape: {labels.shape}")
         return points, labels
 
 

@@ -50,9 +50,11 @@ class SGDATSeg(nn.Module):
     def forward(self, x):
         print(f"Input data shape: {x.shape}")  # 打印输入数据的形状
         B, N, _ = x.shape
+        print(f"[SGDATSeg] Input data shape: {x.shape}")  # 打印输入数据的维度
         coords = x[..., :3]  # 坐标部分 (B, N, 3)
 
         feats = self.encoder(x)  # (B,N,base_dim)
+        print(f"[SGDATSeg] After encoder, feats shape: {feats.shape}")  # 打印编码器后的特征维度
 
         # sample centers indices
         idx1 = torch.randint(0, N, (B, N//2), device=x.device)
