@@ -2,41 +2,7 @@ import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-
-
-def random_rotation(points):
-    # 仅绕 z 轴旋转（塔类场景常见）
-    theta = np.random.uniform(0, 2 * np.pi)
-    c, s = np.cos(theta), np.sin(theta)
-    R = np.array([[c, -s, 0],
-                  [s,  c, 0],
-                  [0,  0, 1]], dtype=np.float32)
-    pts = points.copy()
-    pts[:, :3] = pts[:, :3] @ R.T
-    pts[:, 6:9] = pts[:, 6:9] @ R.T  # 法向也旋转
-    return pts
-
-
-def random_scale(points, scale_low=0.9, scale_high=1.1):
-    s = np.random.uniform(scale_low, scale_high)
-    pts = points.copy()
-    pts[:, :3] *= s
-    return pts
-
-
-def random_translate(points, max_shift=0.02):
-    shift = np.random.uniform(-max_shift, max_shift, size=(1, 3)).astype(np.float32)
-    pts = points.copy()
-    pts[:, :3] += shift
-    return pts
-
-
-def add_noise(points, sigma=0.002, clip=0.01):
-    jitter = np.clip(sigma * np.random.randn(points.shape[0], 3), -clip, clip).astype(np.float32)
-    pts = points.copy()
-    pts[:, :3] += jitter
-    return pts
-
+from math import isfinite
 
 class PointCloudDataset(Dataset):
     """
@@ -48,7 +14,7 @@ class PointCloudDataset(Dataset):
     """
     def __init__(self, root_dir, split="train",
                  rotation=False, scale=False, noise=False, translate=False,
-                 limit_points=True, max_points=20000):
+                 limit_points=True, max_points=20000, normalize=True, num_classes=None):
         super().__init__()
         self.root_dir = os.path.join(root_dir, split)
         self.scene_list = [os.path.join(self.root_dir, s) for s in sorted(os.listdir(self.root_dir))]
@@ -58,12 +24,13 @@ class PointCloudDataset(Dataset):
         self.translate = translate
         self.limit_points = limit_points
         self.max_points = max_points
+        self.normalize = normalize
+        self.num_classes = num_classes  # 用于检查标签合法性
 
     def __len__(self):
         return len(self.scene_list)
 
     def _augment(self, coord):
-        # 简单增强：旋转/缩放/平移/噪声，与之前保持一致
         xyz = coord.copy()
         if self.rotation:
             theta = np.random.uniform(0, 2*np.pi)
@@ -81,6 +48,16 @@ class PointCloudDataset(Dataset):
             xyz = xyz + n
         return xyz
 
+    def _normalize_coords(self, coords):
+        # 平移到中心
+        center = np.mean(coords, axis=0, keepdims=True)
+        coords -= center
+        # 缩放到单位球
+        max_dist = np.max(np.linalg.norm(coords, axis=1))
+        if max_dist > 0:
+            coords /= max_dist
+        return coords.astype(np.float32)
+
     def __getitem__(self, idx):
         scene = self.scene_list[idx]
         coord = np.load(os.path.join(scene, "coord.npy")).astype(np.float32)    # (N,3)
@@ -88,11 +65,28 @@ class PointCloudDataset(Dataset):
         normal = np.load(os.path.join(scene, "normal.npy")).astype(np.float32)  # (N,3)
         label = np.load(os.path.join(scene, "segment20.npy")).astype(np.int64)  # (N,)
 
+        # 标签合法性检查
+        if self.num_classes is not None:
+            assert np.all((label == -1) | ((label >= 0) & (label < self.num_classes))), \
+                f"标签值超出范围: {np.unique(label)}"
+
+        # 数据增强
         if self.rotation or self.scale or self.noise or self.translate:
             coord = self._augment(coord)
 
+        # 归一化
+        if self.normalize:
+            coord = self._normalize_coords(coord)
+
+        # 组装特征
         pts = np.concatenate([coord, color, normal], axis=1).astype(np.float32)  # (N,9)
 
-        pts = torch.from_numpy(pts)      # (N,9)
-        lbl = torch.from_numpy(label)    # (N,)
+        # 限制点数
+        if self.limit_points and pts.shape[0] > self.max_points:
+            choice = np.random.choice(pts.shape[0], self.max_points, replace=False)
+            pts = pts[choice]
+            label = label[choice]
+
+        pts = torch.from_numpy(pts).float()  # 保证 float32
+        lbl = torch.from_numpy(label).long() # 保证 int64
         return pts, lbl

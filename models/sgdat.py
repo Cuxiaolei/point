@@ -10,58 +10,99 @@ except Exception:
     from models.modules_sgdat import ChannelCCC, LinearSpatialGVA, DropPath, DynamicRadiusChannelFusion
 
 
+# -------------------------
+# 数值更稳的工具函数
+# -------------------------
 def normalize_xyz(xyz, eps=1e-6):
+    """
+    对每个样本的点集做居中 + 统一尺度归一化，带极值保护。
+    xyz: (B, N, 3)
+    """
     center = xyz.mean(dim=1, keepdim=True)
     xyz_centered = xyz - center
-    scale = torch.sqrt((xyz_centered ** 2).sum(dim=-1, keepdim=True).max(dim=1, keepdim=True)[0]) + eps
+    # 使用每批次内最大半径作尺度；加入 eps 防 0；再用 clamp 防 NaN/Inf
+    # 半径 = 每个点的范数，取最大
+    radius = torch.sqrt(torch.clamp((xyz_centered ** 2).sum(dim=-1, keepdim=True), min=0.0)).max(dim=1, keepdim=True)[0]
+    scale = torch.clamp(radius, min=eps)
     xyz_normed = xyz_centered / scale
     return xyz_normed
 
+
 def batched_index_points(points, idx):
+    """
+    points: (B, N, C), idx: (B, M)
+    return: (B, M, C)
+    """
     B, N, C = points.shape
     _, M = idx.shape
     batch_indices = torch.arange(B, device=points.device).view(B, 1).repeat(1, M)
     return points[batch_indices, idx, :]
 
+
 def squared_distance(src, dst):
+    """
+    src: (B, N, C), dst: (B, M, C)  ->  (B, N, M)
+    使用数值安全的计算；并下界裁剪到 0。
+    """
     B, N, _ = src.shape
     _, M, _ = dst.shape
-    xx = (src ** 2).sum(dim=-1, keepdim=True)
-    yy = (dst ** 2).sum(dim=-1).unsqueeze(1)
-    xy = torch.bmm(src, dst.transpose(1, 2))
+    xx = (src ** 2).sum(dim=-1, keepdim=True)              # (B, N, 1)
+    yy = (dst ** 2).sum(dim=-1).unsqueeze(1)               # (B, 1, M)
+    xy = torch.bmm(src, dst.transpose(1, 2))               # (B, N, M)
     dist = xx + yy - 2 * xy
+    # 极少数情况下可能出现 -1e-7 这类负值，裁剪为 0
     dist = torch.clamp(dist, min=0.0)
     return dist
 
+
 def nearest_interpolate(target_xyz, source_xyz, source_feat):
-    dist = squared_distance(target_xyz, source_xyz)
-    idx = dist.argmin(dim=-1)
-    feat = batched_index_points(source_feat, idx)
+    """
+    对 target_xyz 中每个点，找到 source_xyz 最近邻并拷贝特征。
+    target_xyz: (B, Nt, 3)
+    source_xyz: (B, Ns, 3)
+    source_feat: (B, Ns, C)
+    return: (B, Nt, C)
+    """
+    dist = squared_distance(target_xyz, source_xyz)        # (B, Nt, Ns)
+    idx = dist.argmin(dim=-1)                              # (B, Nt)
+    feat = batched_index_points(source_feat, idx)          # (B, Nt, C)
     return feat
+
 
 @torch.no_grad()
 def farthest_point_sample(xyz, npoint):
+    """
+    远点采样（无梯度以提升稳定与速度）
+    xyz: (B, N, 3)
+    return: idx (B, npoint)
+    """
     device = xyz.device
     B, N, _ = xyz.shape
+    npoint = min(npoint, N)
     idx = torch.zeros(B, npoint, dtype=torch.long, device=device)
     distances = torch.full((B, N), 1e10, device=device)
     farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
     batch_indices = torch.arange(B, dtype=torch.long, device=device)
     for i in range(npoint):
         idx[:, i] = farthest
-        centroid = xyz[batch_indices, farthest, :].unsqueeze(1)
-        dist = ((xyz - centroid) ** 2).sum(-1)
+        centroid = xyz[batch_indices, farthest, :].unsqueeze(1)   # (B,1,3)
+        dist = ((xyz - centroid) ** 2).sum(-1)                    # (B,N)
         distances = torch.minimum(distances, dist)
         farthest = distances.argmax(dim=-1)
     return idx
 
 
+# -------------------------
+# 组件
+# -------------------------
 class SharedMLP1D(nn.Module):
-    def __init__(self, cin, cout, bn=True, act=True, dropout: float = 0.0):
+    def __init__(self, cin, cout, bn=True, act=True, dropout: float = 0.0,
+                 bn_eps: float = 1e-3, bn_momentum: float = 0.01):
         super().__init__()
         layers = [nn.Conv1d(cin, cout, kernel_size=1, bias=not bn)]
         if bn:
-            layers.append(nn.BatchNorm1d(cout))
+            bn1 = nn.BatchNorm1d(cout, eps=bn_eps, momentum=bn_momentum)
+            layers.append(bn1)
         if act:
             layers.append(nn.ReLU(inplace=True))
         if dropout and dropout > 0.0:
@@ -69,12 +110,16 @@ class SharedMLP1D(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
+        # 输入 (B,N,C) -> Conv1d 需要 (B,C,N)
         x = x.permute(0, 2, 1).contiguous()
         x = self.net(x)
         x = x.permute(0, 2, 1).contiguous()
         return x
 
 
+# -------------------------
+# 主干网络
+# -------------------------
 class SGDAT(nn.Module):
     def __init__(
         self,
@@ -96,6 +141,9 @@ class SGDAT(nn.Module):
         dyn_neighbors: int = 16,
         dyn_min_radius: float = 0.02,
         dyn_max_radius: float = 0.30,
+        # ====== BN 稳定性参数 ======
+        bn_eps: float = 1e-3,
+        bn_momentum: float = 0.01,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -117,14 +165,20 @@ class SGDAT(nn.Module):
         self.dyn_min_radius = dyn_min_radius
         self.dyn_max_radius = dyn_max_radius
 
+        self.bn_eps = float(bn_eps)
+        self.bn_momentum = float(bn_momentum)
+
         # Encoder level-0 (N points): 输入 9 维
-        self.enc0 = SharedMLP1D(9, base_dim, dropout=self.dropout_p)  # (B,N,64)
+        self.enc0 = SharedMLP1D(9, base_dim, dropout=self.dropout_p,
+                                bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)  # (B,N,64)
 
         # 512 层编码： [xyz(3)+feat64] -> 64
-        self.enc512 = SharedMLP1D(3 + base_dim, base_dim, dropout=self.dropout_p)  # (B,512,64)
+        self.enc512 = SharedMLP1D(3 + base_dim, base_dim, dropout=self.dropout_p,
+                                  bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)  # (B,512,64)
 
         # 128 层编码： [xyz(3)+feat64] -> 128
-        self.enc128 = SharedMLP1D(3 + base_dim, base_dim * 2, dropout=self.dropout_p)  # (B,128,128)
+        self.enc128 = SharedMLP1D(3 + base_dim, base_dim * 2, dropout=self.dropout_p,
+                                  bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)  # (B,128,128)
 
         # 可选通道注意力
         if self.use_channel_ccc:
@@ -153,8 +207,10 @@ class SGDAT(nn.Module):
             self.dyn128 = None
 
         # 位置编码
-        self.pos512 = SharedMLP1D(3, base_dim * 2, dropout=self.dropout_p)   # 3 -> 128
-        self.posN   = SharedMLP1D(3, base_dim,     dropout=self.dropout_p)   # 3 -> 64
+        self.pos512 = SharedMLP1D(3, base_dim * 2, dropout=self.dropout_p,
+                                  bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)   # 3 -> 128
+        self.posN   = SharedMLP1D(3, base_dim,     dropout=self.dropout_p,
+                                  bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)   # 3 -> 64
 
         # 线性 GVA（在融合后的 512、N 尺度）
         if self.use_linear_gva:
@@ -167,13 +223,13 @@ class SGDAT(nn.Module):
         # Decoder 融合
         self.up1 = nn.Sequential(
             nn.Conv1d(base_dim + base_dim * 2 + base_dim * 2, base_dim * 2, 1),  # 64 + 128 + 128 -> 128
-            nn.BatchNorm1d(base_dim * 2),
+            nn.BatchNorm1d(base_dim * 2, eps=self.bn_eps, momentum=self.bn_momentum),
             nn.ReLU(inplace=True),
             nn.Dropout(p=self.dropout_p) if self.dropout_p > 0 else nn.Identity()
         )
         self.up2 = nn.Sequential(
             nn.Conv1d(base_dim * 2 + base_dim + base_dim, base_dim * 2, 1),      # 128 + 64 + 64 -> 128
-            nn.BatchNorm1d(base_dim * 2),
+            nn.BatchNorm1d(base_dim * 2, eps=self.bn_eps, momentum=self.bn_momentum),
             nn.ReLU(inplace=True),
             nn.Dropout(p=self.dropout_p) if self.dropout_p > 0 else nn.Identity()
         )
@@ -185,6 +241,35 @@ class SGDAT(nn.Module):
         # 分类头
         self.head = nn.Conv1d(base_dim * 2, num_classes, kernel_size=1)
 
+        # 统一数值稳定的初始化
+        self.apply(self._init_stable)
+
+    # ---------- 初始化 ----------
+    @staticmethod
+    def _init_stable(m: nn.Module):
+        """
+        更稳的默认初始化：
+        - Conv: Kaiming Normal (fan_out, relu)，bias=0
+        - Linear: Xavier Normal，bias=0
+        - BN: weight=1, bias=0（保守），其 eps/momentum 由构造时指定
+        """
+        if isinstance(m, (nn.Conv1d, nn.Conv2d)):
+            if m.weight is not None:
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if getattr(m, "bias", None) is not None and m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Linear):
+            if m.weight is not None:
+                nn.init.xavier_normal_(m.weight)
+            if getattr(m, "bias", None) is not None and m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
+            if getattr(m, "weight", None) is not None and m.weight is not None:
+                nn.init.ones_(m.weight)
+            if getattr(m, "bias", None) is not None and m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    # ---------- 内部辅助 ----------
     def _sample_and_gather(self, xyz, feat, npoint):
         idx = farthest_point_sample(xyz, npoint)
         xyz_s = batched_index_points(xyz, idx)
@@ -195,6 +280,7 @@ class SGDAT(nn.Module):
         if not self.training:
             return points
         out = points
+        # RGB/Normal 按组丢弃；不改 shape
         if self.drop_rgb_p > 0.0 and torch.rand(1, device=points.device).item() < self.drop_rgb_p:
             out = out.clone()
             out[:, :, 3:6] = 0.0
@@ -203,6 +289,7 @@ class SGDAT(nn.Module):
             out[:, :, 6:9] = 0.0
         return out
 
+    # ---------- 前向 ----------
     def forward(self, points):
         """
         points: (B, N, 9) -> [xyz(0:3), rgb(3:6), normal(6:9)]
@@ -244,7 +331,6 @@ class SGDAT(nn.Module):
 
         # —— 动态邻域-通道融合 @128：在 512 子集上用 idx_128 聚合 feat_512(512,64) -> (B,128,128)
         if self.use_dynamic_fusion and self.dyn128 is not None:
-            # 注意：此处 points/feats 与 center_idx 对齐在 512 子集空间
             dyn_128, _ = self.dyn128(points=xyz_512, feats=feat_512, center_idx=idx_128)  # (B,128,128)
             feat_128 = feat_128 + dyn_128  # 残差融合
 
@@ -293,6 +379,7 @@ class SGDAT(nn.Module):
 
         return logits
 
+    # ---------- Loss（保持你原有稳定性守护） ----------
     def get_loss(
             self,
             points,
@@ -395,4 +482,3 @@ class SGDAT(nn.Module):
             "valid_points": int(valid_mask.sum().item())
         }
         return loss, logits, stats
-

@@ -12,7 +12,24 @@ from tqdm import tqdm
 from sklearn.metrics import confusion_matrix
 from torch.amp import GradScaler, autocast
 import torch.nn.utils as nn_utils
-# 11
+
+# =========================
+# 新增：可配置的数值稳定参数（从 config 中读取，无则采用这里的默认）
+# =========================
+DEFAULTS = {
+    "CLIP_NORM": 2.0,
+    "DET_COLLECT_LOGITS_NAN_ONCE": True,
+    "SKIP_STEP_LOSS_THRESH": 1e6,  # loss 超过阈值跳过该 step
+    "DETECT_ANOMALY": False,       # 开启 autograd 异常检测（调试时用，训练建议关）
+    "POINT_DROPOUT_ENABLE": False,
+    "POINT_DROPOUT_RATE": 0.1,
+    "POINTCUTMIX_ENABLE": False,
+    "POINTCUTMIX_PROB": 0.1,
+    "POINTCUTMIX_RATIO": 0.2,
+}
+
+def _cfg_val(cfg, key):
+    return getattr(cfg, key, DEFAULTS.get(key))
 
 class ModelEMA:
     """指数滑动平均（不改变原模型结构）"""
@@ -150,7 +167,7 @@ class Trainer:
 
         self.epoch_records = []  # 每轮汇总
 
-        # class weights
+        # class weights（来自外部或内部统计）
         if class_weights is not None:
             if isinstance(class_weights, torch.Tensor):
                 self.class_weights = class_weights.detach().clone().to(self.device, dtype=torch.float32)
@@ -232,7 +249,7 @@ class Trainer:
         )
 
         # grad clipping threshold（可在 config 中覆写）
-        self.clip_norm = getattr(config, 'CLIP_NORM', 2.0)
+        self.clip_norm = _cfg_val(config, 'CLIP_NORM')
 
         # 日志与保存目录
         os.makedirs(config.MODEL_SAVE_DIR, exist_ok=True)
@@ -241,8 +258,9 @@ class Trainer:
         # 记录最佳 val mIoU
         self.best_val_miou = 0.0
 
-        # 计算 class weights
-        self.class_weights = self._compute_class_weights()
+        # 计算/设定 class weights（若外部未给）
+        if self.class_weights is None:
+            self.class_weights = self._compute_class_weights()
         print(f"[Trainer] class_weights: {self.class_weights}")
 
         # EMA
@@ -251,13 +269,22 @@ class Trainer:
         # Early Stopping
         self.early_stop_counter = 0
 
+        # 仅在需要时打开异常检测
+        if _cfg_val(config, "DETECT_ANOMALY"):
+            torch.autograd.set_detect_anomaly(True)
+
         # 打印配置
-        config.print_config()
+        if hasattr(config, "print_config"):
+            config.print_config()
+
+        # 每轮只提示一次 logits NaN 的标志
+        self._logits_nan_warned = False
 
     def _compute_class_weights(self):
         """统计训练集中每类样本数并返回归一化权重张量"""
         counts = np.zeros(self.config.NUM_CLASSES, dtype=np.int64)
-        for scene in self.train_dataset.scene_list:
+        # 与你原来一致的统计方式（scene_list/segment20.npy）
+        for scene in getattr(self.train_dataset, "scene_list", []):
             seg_path = os.path.join(scene, 'segment20.npy')
             if os.path.exists(seg_path):
                 arr = np.load(seg_path).flatten()
@@ -271,6 +298,53 @@ class Trainer:
         weights = np.where(np.isfinite(weights), weights, 1.0)
         tensor_weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
         return tensor_weights
+
+    @torch.no_grad()
+    def _sanitize_batch(self, points, labels):
+        """
+        根源级批次清理：处理 NaN/Inf/极值 & 标签越界
+        - points: (B,N,C) -> nan_to_num，clamp 到合理范围（避免坐标爆炸）
+        - labels: (B,N)   -> 合法集合 { -1, 0..K-1 }，非法置 -1
+        """
+        # points
+        torch.nan_to_num_(points, nan=0.0, posinf=1e6, neginf=-1e6)
+        # 可选对坐标/特征做全局裁剪（若你的数据范围更大可调大些）
+        points.clamp_(min=-1e6, max=1e6)
+
+        # labels
+        K = self.config.NUM_CLASSES
+        valid_mask = (labels == -1) | ((labels >= 0) & (labels < K))
+        labels = torch.where(valid_mask, labels, torch.full_like(labels, -1))
+        return points, labels
+
+    def _fallback_loss(self, logits, labels,
+                       class_weights=None, ignore_index=-1,
+                       label_smoothing=0.0, focal_gamma=0.0):
+        """
+        当模型暂时没有 get_loss 时的稳健回退 CE/Focal 组合（与验证端一致）
+        """
+        # 展平
+        B, N, K = logits.shape
+        x = logits.reshape(B * N, K)
+        y = labels.reshape(B * N)
+
+        # 先做稳定 cross_entropy（带 label smoothing）
+        ce = torch.nn.functional.cross_entropy(
+            x, y,
+            weight=class_weights,
+            ignore_index=ignore_index,
+            label_smoothing=label_smoothing
+        )
+
+        if focal_gamma and focal_gamma > 0.0:
+            # 简易 focal：在有效样本上基于预测概率重新加权
+            with torch.no_grad():
+                pt = torch.softmax(x, dim=-1).gather(1, torch.clamp(y.unsqueeze(1), 0, K-1)).squeeze(1)
+                mask = (y != ignore_index)
+                pt = torch.where(mask, pt, torch.ones_like(pt))
+                focal_w = (1 - pt) ** focal_gamma
+            ce = (ce * focal_w.mean())  # 标量缩放（避免与ignore_index冲突）
+        return ce
 
     def _miou_from_labels_preds(self, labels_list, preds_list, num_classes):
         """从累积的标签/预测计算 per-class IoU 与 mIoU"""
@@ -312,50 +386,88 @@ class Trainer:
             points = points.to(self.device, non_blocking=True)   # (B,N,C)
             labels = labels.to(self.device, non_blocking=True)   # (B,N)
 
+            # 根源清理：NaN/Inf/越界标签
+            points, labels = self._sanitize_batch(points, labels)
+
             # --- 反过拟合策略：点丢弃 ---
-            if getattr(self.config, "POINT_DROPOUT_ENABLE", False):
+            if _cfg_val(self.config, "POINT_DROPOUT_ENABLE"):
                 points, labels = random_point_dropout(
-                    points, labels, drop_rate=getattr(self.config, "POINT_DROPOUT_RATE", 0.1)
+                    points, labels, drop_rate=_cfg_val(self.config, "POINT_DROPOUT_RATE")
                 )
 
             # --- 反过拟合策略：PointCutMix ---
-            if getattr(self.config, "POINTCUTMIX_ENABLE", False):
+            if _cfg_val(self.config, "POINTCUTMIX_ENABLE"):
                 points, labels = point_cutmix(
                     points, labels,
-                    prob=getattr(self.config, "POINTCUTMIX_PROB", 0.1),
-                    ratio=getattr(self.config, "POINTCUTMIX_RATIO", 0.2)
+                    prob=_cfg_val(self.config, "POINTCUTMIX_PROB"),
+                    ratio=_cfg_val(self.config, "POINTCUTMIX_RATIO")
                 )
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
+
             # forward + loss (with AMP)
             with autocast(device_type='cuda', enabled=self.scaler is not None):
-                loss, logits, stats = self.model.get_loss(
-                    points, labels,
-                    class_weights=self.class_weights if hasattr(self, 'class_weights') else None,
-                    ignore_index=-1,
-                    aux_weight=0.4,
-                    label_smoothing=0.05,
-                    focal_gamma=1.5,
-                )
+                if hasattr(self.model, "get_loss"):
+                    loss, logits, stats = self.model.get_loss(
+                        points, labels,
+                        class_weights=self.class_weights if hasattr(self, 'class_weights') else None,
+                        ignore_index=-1,
+                        aux_weight=0.4,
+                        label_smoothing=0.05,
+                        focal_gamma=1.5,
+                    )
+                else:
+                    logits = self.model(points)
+                    loss = self._fallback_loss(
+                        logits, labels,
+                        class_weights=self.class_weights if hasattr(self, 'class_weights') else None,
+                        ignore_index=-1,
+                        label_smoothing=0.05,
+                        focal_gamma=1.5
+                    )
 
-            # numeric check
-            if torch.isnan(loss) or torch.isinf(loss):
+            # 数值检查
+            if (not torch.isfinite(loss)) or (loss.item() > _cfg_val(self.config, "SKIP_STEP_LOSS_THRESH")):
                 save_path = os.path.join(self.config.MODEL_SAVE_DIR, f"bad_loss_epoch{epoch}_batch{batch_idx}.pth")
                 torch.save(self.model.state_dict(), save_path)
-                raise RuntimeError(f"Encountered bad loss (NaN/Inf) at epoch {epoch} batch {batch_idx}. Model saved to {save_path}")
+                self.logger.warning(f"[SkipStep] 非法或过大损失 loss={loss.item():.4g}，跳过该步。模型已保存到 {save_path}")
+                # 跳过优化，但继续训练
+                continue
 
-            # backward
+            # 反传 + 梯度裁剪 + step
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
                 # gradient clipping
                 self.scaler.unscale_(self.optimizer)
                 nn_utils.clip_grad_norm_(self.model.parameters(), self.clip_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+
+                # 检查梯度是否有限
+                grads_finite = True
+                for p in self.model.parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        grads_finite = False
+                        break
+                if not grads_finite:
+                    self.logger.warning("[SkipStep] 梯度出现 NaN/Inf，跳过该步更新。")
+                    self.optimizer.zero_grad(set_to_none=True)
+                else:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
             else:
                 loss.backward()
                 nn_utils.clip_grad_norm_(self.model.parameters(), self.clip_norm)
-                self.optimizer.step()
+
+                # 检查梯度是否有限
+                grads_finite = True
+                for p in self.model.parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        grads_finite = False
+                        break
+                if not grads_finite:
+                    self.logger.warning("[SkipStep] 梯度出现 NaN/Inf，跳过该步更新。")
+                    self.optimizer.zero_grad(set_to_none=True)
+                else:
+                    self.optimizer.step()
 
             # EMA 更新
             if self.ema is not None:
@@ -366,20 +478,30 @@ class Trainer:
             if mask.sum() == 0:
                 pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": "N/A", "有效点": 0})
             else:
-                preds = logits.argmax(dim=-1)
-                correct = (preds[mask] == labels[mask]).sum().item()
-                total_correct += correct
-                total_points += mask.sum().item()
-                # 累计训练 IoU 数据
-                train_lbls_all.append(labels[mask].detach().cpu().numpy().flatten())
-                train_preds_all.append(preds[mask].detach().cpu().numpy().flatten())
+                with torch.no_grad():
+                    # 有些模型的 get_loss 已返回 logits；保守处理：必要时再前向一次
+                    if 'logits' not in locals() or logits is None:
+                        logits = self.model(points)
+                    # 一次性 logits NaN 告警（可关）
+                    if (not self._logits_nan_warned) and _cfg_val(self.config, "DET_COLLECT_LOGITS_NAN_ONCE"):
+                        if (not torch.isfinite(logits)).any():
+                            self._logits_nan_warned = True
+                            self.logger.warning("[NaN Debug] 在 logits 中检测到 NaN/Inf。")
 
-                batch_acc = correct / mask.sum().item()
-                pbar.set_postfix({
-                    "loss": f"{loss.item():.4f}",
-                    "acc": f"{batch_acc:.4f}",
-                    "有效点": f"{mask.sum().item()}"
-                })
+                    preds = logits.argmax(dim=-1)
+                    correct = (preds[mask] == labels[mask]).sum().item()
+                    total_correct += correct
+                    total_points += mask.sum().item()
+                    # 累计训练 IoU 数据
+                    train_lbls_all.append(labels[mask].detach().cpu().numpy().flatten())
+                    train_preds_all.append(preds[mask].detach().cpu().numpy().flatten())
+
+                    batch_acc = correct / mask.sum().item()
+                    pbar.set_postfix({
+                        "loss": f"{loss.item():.4f}",
+                        "acc": f"{batch_acc:.4f}",
+                        "有效点": f"{mask.sum().item()}"
+                    })
 
             total_loss += loss.item()
 
@@ -437,15 +559,28 @@ class Trainer:
                     pbar.set_postfix({"val_loss": "N/A", "val_acc": "N/A", "有效点": 0})
                     continue
 
+                # 验证也做批次清理，避免偶发脏值影响指标
+                points, labels = self._sanitize_batch(points, labels)
+
                 with autocast(device_type='cuda', enabled=self.scaler is not None):
-                    loss, logits, _ = self.model.get_loss(
-                        points, labels,
-                        class_weights=self.class_weights if hasattr(self, 'class_weights') else None,
-                        ignore_index=-1,
-                        aux_weight=0.4,
-                        label_smoothing=0.0,
-                        focal_gamma=0.0
-                    )
+                    if hasattr(self.model, "get_loss"):
+                        loss, logits, _ = self.model.get_loss(
+                            points, labels,
+                            class_weights=self.class_weights if hasattr(self, 'class_weights') else None,
+                            ignore_index=-1,
+                            aux_weight=0.4,
+                            label_smoothing=0.0,
+                            focal_gamma=0.0
+                        )
+                    else:
+                        logits = self.model(points)
+                        loss = self._fallback_loss(
+                            logits, labels,
+                            class_weights=self.class_weights if hasattr(self, 'class_weights') else None,
+                            ignore_index=-1,
+                            label_smoothing=0.0,
+                            focal_gamma=0.0
+                        )
 
                 preds = logits.argmax(dim=-1)
                 mask = (labels != -1)
@@ -492,11 +627,10 @@ class Trainer:
         self.logger.info(msg)
 
         # 打印 per-class IoU（仅展示出现过的类为主）
-        present = [c for c, v in per_class_iou.items() if v > 0]
+        present = [c for c in per_class_iou.items() if c[1] > 0]
         print("[IoU per class]")
         for cls in range(self.config.NUM_CLASSES):
-            if (cls in present) or (per_class_iou[cls] > 0):
-                print(f"  [IoU] class {cls}: {per_class_iou[cls]:.4f}")
+            print(f"  [IoU] class {cls}: {per_class_iou.get(cls, 0.0):.4f}")
 
         if using_ema:
             self.ema.restore(self.model)
@@ -546,7 +680,7 @@ class Trainer:
             for epoch in range(1, self.config.MAX_EPOCHS + 1):
                 train_loss, train_acc, train_miou, _ = self.train_epoch(epoch)
 
-                # scheduler
+                # === 注意：这里的 scheduler.step() 在整轮优化器更新之后调用（不会触发 PyTorch 警告）===
                 self.scheduler.step()
                 self.writer.add_scalar("lr", self.optimizer.param_groups[0]["lr"], epoch)
 
