@@ -4,7 +4,7 @@ import os
 import collections
 
 from models.sgdat import SGDAT
-from datasets.point_cloud_dataset import PointCloudDataset
+from datasets.point_cloud_dataset import PointCloudDataset, PointCloudTransform
 from trainer import Trainer
 from config import Config
 
@@ -36,7 +36,7 @@ def compute_class_weights(train_dataset, num_classes):
 
     counts = np.array([cnt.get(i, 0) for i in range(num_classes)], dtype=np.float32)
     weights = counts.sum() / (counts + 1e-6)  # 防止除 0
-    weights = weights / weights.mean()  # 归一化
+    weights = weights / (weights.mean() + 1e-12)  # 归一化
     print(f"[Trainer] class counts: {counts}")
     print(f"[Trainer] class_weights: {weights}")
     return torch.tensor(weights, dtype=torch.float32)
@@ -48,29 +48,35 @@ def main():
     # 加载配置
     config = Config()
 
-    # 数据集
+    # 数据增强（与你现有的数据集接口保持一致）
+    transform = PointCloudTransform(
+        rotation=config.ROTATION_AUG,
+        scale=config.SCALE_AUG,
+        noise=config.NOISE_AUG,
+        translate=config.TRANSFORM_AUG
+    )
+
+    # 数据集（保持你的 PointCloudDataset 的参数签名）
     train_dataset = PointCloudDataset(
-        root_dir=config.DATA_ROOT,
+        config.DATA_ROOT,
         split="train",
         rotation=config.ROTATION_AUG,
         scale=config.SCALE_AUG,
         noise=config.NOISE_AUG,
         translate=config.TRANSFORM_AUG,
-        limit_points=config.LIMIT_POINTS,
-        max_points=config.MAX_POINTS
+        max_points=config.MAX_POINTS if config.LIMIT_POINTS else None
     )
     val_dataset = PointCloudDataset(
-        root_dir=config.DATA_ROOT,
+        config.DATA_ROOT,
         split="val",
         rotation=False,
         scale=False,
         noise=False,
         translate=False,
-        limit_points=config.LIMIT_POINTS,
-        max_points=config.MAX_POINTS
+        max_points=config.MAX_POINTS if config.LIMIT_POINTS else None
     )
 
-    # 类别数
+    # 类别数自动推断（仍然会被 config.NUM_CLASSES 覆盖/更新）
     num_classes = infer_num_classes_from_dataset(train_dataset, val_dataset)
     print(f"[INFO] Inferred num_classes = {num_classes}")
     config.NUM_CLASSES = num_classes
@@ -78,12 +84,13 @@ def main():
     # 类别权重
     class_weights = compute_class_weights(train_dataset, num_classes).to(config.DEVICE)
 
-    # 初始化模型
+    # 初始化模型（保留你原有签名，新增 dropout_rate 透传）
     model = SGDAT(
         num_classes=config.NUM_CLASSES,
         base_dim=64,
         max_points=config.MAX_POINTS if config.LIMIT_POINTS else None,
-        debug=True
+        debug=True,
+        dropout_rate=getattr(config, "DROPOUT_RATE", 0.1)
     )
 
     # 打印参数
@@ -92,7 +99,7 @@ def main():
     print(f"模型总参数: {total_params:,}")
     print(f"可训练参数: {trainable_params:,}")
 
-    # 初始化 Trainer
+    # 初始化 Trainer（反过拟合策略交给 Trainer 控制）
     trainer = Trainer(model, config, train_dataset, val_dataset, class_weights=class_weights)
     trainer.train()
 

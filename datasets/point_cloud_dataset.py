@@ -3,26 +3,55 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+
+def random_rotation(points):
+    # 仅绕 z 轴旋转（塔类场景常见）
+    theta = np.random.uniform(0, 2 * np.pi)
+    c, s = np.cos(theta), np.sin(theta)
+    R = np.array([[c, -s, 0],
+                  [s,  c, 0],
+                  [0,  0, 1]], dtype=np.float32)
+    pts = points.copy()
+    pts[:, :3] = pts[:, :3] @ R.T
+    pts[:, 6:9] = pts[:, 6:9] @ R.T  # 法向也旋转
+    return pts
+
+
+def random_scale(points, scale_low=0.9, scale_high=1.1):
+    s = np.random.uniform(scale_low, scale_high)
+    pts = points.copy()
+    pts[:, :3] *= s
+    return pts
+
+
+def random_translate(points, max_shift=0.02):
+    shift = np.random.uniform(-max_shift, max_shift, size=(1, 3)).astype(np.float32)
+    pts = points.copy()
+    pts[:, :3] += shift
+    return pts
+
+
+def add_noise(points, sigma=0.002, clip=0.01):
+    jitter = np.clip(sigma * np.random.randn(points.shape[0], 3), -clip, clip).astype(np.float32)
+    pts = points.copy()
+    pts[:, :3] += jitter
+    return pts
+
+
 class PointCloudDataset(Dataset):
+    """
+    每个场景目录下：
+      - coord.npy   (N,3)
+      - color.npy   (N,3)
+      - normal.npy  (N,3)
+      - segment20.npy (N,)  # label, 取值 {0..K-1}，无 pad；pad 在 collate 里补 -1
+    """
     def __init__(self, root_dir, split="train",
                  rotation=False, scale=False, noise=False, translate=False,
                  limit_points=True, max_points=20000):
-        """
-        :param root_dir: 数据集根目录
-        :param split: "train" 或 "val"
-        :param rotation: 是否旋转增强
-        :param scale: 是否缩放增强
-        :param noise: 是否加噪声
-        :param translate: 是否平移增强
-        :param limit_points: 是否限制点数
-        :param max_points: 限制的最大点数
-        """
-        self.root_dir = root_dir
-        self.split = split
-        self.scene_list = [
-            os.path.join(root_dir, split, s)
-            for s in sorted(os.listdir(os.path.join(root_dir, split)))
-        ]
+        super().__init__()
+        self.root_dir = os.path.join(root_dir, split)
+        self.scene_list = [os.path.join(self.root_dir, s) for s in sorted(os.listdir(self.root_dir))]
         self.rotation = rotation
         self.scale = scale
         self.noise = noise
@@ -33,73 +62,37 @@ class PointCloudDataset(Dataset):
     def __len__(self):
         return len(self.scene_list)
 
-    def __getitem__(self, idx):
-        scene_path = self.scene_list[idx]
-        points_path = os.path.join(scene_path, "points.npy")
-
-        # 1. 优先使用 points.npy
-        if os.path.exists(points_path):
-            points = np.load(points_path)
-        else:
-            # 2. 动态拼接 coord + color + normal
-            coord = np.load(os.path.join(scene_path, "coord.npy"))  # (N,3)
-            color = np.load(os.path.join(scene_path, "color.npy"))  # (N,3)
-            normal = np.load(os.path.join(scene_path, "normal.npy"))  # (N,3)
-
-            # 颜色归一化到 0~1
-            if color.max() > 1.0:
-                color = color.astype(np.float32) / 255.0
-
-            points = np.concatenate([coord, color, normal], axis=1)  # (N, 9)
-
-        labels = np.load(os.path.join(scene_path, "segment20.npy"))  # (N,)
-
-        # 数据增强
+    def _augment(self, coord):
+        # 简单增强：旋转/缩放/平移/噪声，与之前保持一致
+        xyz = coord.copy()
         if self.rotation:
-            theta = np.random.uniform(0, 2 * np.pi)
-            rot_matrix = np.array([[np.cos(theta), -np.sin(theta), 0],
-                                   [np.sin(theta), np.cos(theta), 0],
-                                   [0, 0, 1]], dtype=np.float32)
-            points[:, :3] = points[:, :3] @ rot_matrix
-
+            theta = np.random.uniform(0, 2*np.pi)
+            cos, sin = np.cos(theta), np.sin(theta)
+            R = np.array([[cos, -sin, 0],[sin, cos, 0],[0,0,1]], dtype=np.float32)
+            xyz = (xyz @ R.T).astype(np.float32)
         if self.scale:
-            scale_factor = np.random.uniform(0.9, 1.1)
-            points[:, :3] *= scale_factor
-
-        if self.noise:
-            noise = np.random.normal(0, 0.005, size=points[:, :3].shape)
-            points[:, :3] += noise
-
+            s = np.random.uniform(0.9, 1.1)
+            xyz = (xyz * s).astype(np.float32)
         if self.translate:
-            translation = np.random.uniform(-0.2, 0.2, size=(1, 3))
-            points[:, :3] += translation
+            t = np.random.uniform(-0.1, 0.1, size=(1,3)).astype(np.float32)
+            xyz = xyz + t
+        if self.noise:
+            n = np.random.normal(0, 0.005, size=xyz.shape).astype(np.float32)
+            xyz = xyz + n
+        return xyz
 
-        # 限制点数
-        if self.limit_points and self.max_points is not None and points.shape[0] > self.max_points:
-            choice = np.random.choice(points.shape[0], self.max_points, replace=False)
-            points = points[choice]
-            labels = labels[choice]
+    def __getitem__(self, idx):
+        scene = self.scene_list[idx]
+        coord = np.load(os.path.join(scene, "coord.npy")).astype(np.float32)    # (N,3)
+        color = np.load(os.path.join(scene, "color.npy")).astype(np.float32)    # (N,3)
+        normal = np.load(os.path.join(scene, "normal.npy")).astype(np.float32)  # (N,3)
+        label = np.load(os.path.join(scene, "segment20.npy")).astype(np.int64)  # (N,)
 
-        return torch.tensor(points, dtype=torch.float32), torch.tensor(labels, dtype=torch.long)
+        if self.rotation or self.scale or self.noise or self.translate:
+            coord = self._augment(coord)
 
-    def random_transform(self, pts):
-        # 占位：这里可以加额外的空间变换
-        return pts
+        pts = np.concatenate([coord, color, normal], axis=1).astype(np.float32)  # (N,9)
 
-    def random_rotation(self, pts):
-        theta = np.random.uniform(0, 2 * np.pi)
-        rot_matrix = np.array([[np.cos(theta), -np.sin(theta), 0],
-                                [np.sin(theta), np.cos(theta), 0],
-                                [0, 0, 1]])
-        pts[:, :3] = pts[:, :3] @ rot_matrix
-        return pts
-
-    def random_scale(self, pts, scale_range=(0.9, 1.1)):
-        scale = np.random.uniform(scale_range[0], scale_range[1])
-        pts[:, :3] *= scale
-        return pts
-
-    def random_noise(self, pts, sigma=0.005):
-        noise = np.random.normal(0, sigma, pts[:, :3].shape)
-        pts[:, :3] += noise
-        return pts
+        pts = torch.from_numpy(pts)      # (N,9)
+        lbl = torch.from_numpy(label)    # (N,)
+        return pts, lbl

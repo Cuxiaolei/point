@@ -1,7 +1,9 @@
-# models/modules_sgdat.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import Dropout
+import random
+from config import Config
 
 def pairwise_distance(a, b):
     """(B, M, 3), (B, N, 3) -> (B, M, N) squared distances"""
@@ -15,10 +17,8 @@ def farthest_point_sample(xyz, npoint):
     device = xyz.device
     B, N, _ = xyz.shape
     if npoint >= N:
-        # return full range indices
         idx = torch.arange(N, device=device).unsqueeze(0).repeat(B,1)
-        return idx[:, :npoint]  # if equal, fine
-    # initialize
+        return idx[:, :npoint]
     centroids = torch.zeros(B, npoint, dtype=torch.long, device=device)
     distance = torch.full((B, N), 1e10, device=device)
     farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
@@ -26,9 +26,7 @@ def farthest_point_sample(xyz, npoint):
     for i in range(npoint):
         centroids[:, i] = farthest
         centroid_xyz = xyz[batch_indices, farthest, :].view(B,1,3)
-        # squared dist
         dist = ((xyz - centroid_xyz) ** 2).sum(-1)
-        # update min distances
         mask = dist < distance
         distance[mask] = dist[mask]
         farthest = torch.max(distance, dim=1)[1]
@@ -67,7 +65,6 @@ class DynamicRadiusChannelFusion(nn.Module):
         self.in_ch = in_channels
         self.out_ch = out_channels
 
-        # small normalization before projecting to avoid huge values
         self.pre_norm = nn.LayerNorm(in_channels * 2)
 
         self.channel_proj = nn.Sequential(
@@ -78,38 +75,37 @@ class DynamicRadiusChannelFusion(nn.Module):
         )
         self.mlp = nn.Sequential(
             nn.Linear(in_channels, out_channels),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
+            nn.Dropout(Config.DROPOUT_RATE) if Config.ENABLE_DROPOUT else nn.Identity()
         )
+        self.drop_path = DropPath(Config.DROPPATH_PROB) if Config.ENABLE_DROPPATH else nn.Identity()
 
     def forward(self, points, feats, center_idx):
-        # points: (B,N,3), feats: (B,N,C), center_idx: (B,M)
         B, N, _ = points.shape
-        if center_idx.dim() != 2:
-            raise RuntimeError(f"center_idx expected (B,M), got {center_idx.shape}")
         M = center_idx.shape[1]
-        centers = torch.gather(points, 1, center_idx.unsqueeze(-1).repeat(1,1,3))  # (B,M,3)
-
+        centers = torch.gather(points, 1, center_idx.unsqueeze(-1).repeat(1,1,3))
         dist2 = pairwise_distance(centers, points).clamp(min=0.0)
-        dist = torch.sqrt(dist2 + 1e-8)  # (B,M,N)
+        dist = torch.sqrt(dist2 + 1e-8)
 
-        knn_idx = safe_knn_idx(dist, self.max_radius, self.num_neighbors, N)  # (B,M,K)
+        knn_idx = safe_knn_idx(dist, self.max_radius, self.num_neighbors, N)
 
-        # gather neighbor features
         K = knn_idx.size(-1)
         batch_inds = torch.arange(B, device=points.device).view(B,1,1).expand(-1, M, K)
-        neigh_feats = feats[batch_inds, knn_idx]  # (B,M,K,C)
-        centers_feats = torch.gather(feats, 1, center_idx.unsqueeze(-1).repeat(1,1,self.in_ch))  # (B,M,C)
-        centers_feats_exp = centers_feats.unsqueeze(2).expand(-1, -1, K, -1)  # (B,M,K,C)
+        neigh_feats = feats[batch_inds, knn_idx]
+        centers_feats = torch.gather(feats, 1, center_idx.unsqueeze(-1).repeat(1,1,self.in_ch))
+        centers_feats_exp = centers_feats.unsqueeze(2).expand(-1, -1, K, -1)
 
-        combo = torch.cat([centers_feats_exp, neigh_feats], dim=-1)  # (B,M,K,2C)
+        combo = torch.cat([centers_feats_exp, neigh_feats], dim=-1)
         combo_flat = combo.view(-1, combo.size(-1))
-        # normalize then project
         combo_norm = self.pre_norm(combo_flat)
-        channel_w = self.channel_proj(combo_norm).view(B, M, K, self.in_ch)  # (B,M,K,C)
+        channel_w = self.channel_proj(combo_norm).view(B, M, K, self.in_ch)
 
-        weighted = (neigh_feats * channel_w).mean(dim=2)  # (B,M,C)
+        weighted = (neigh_feats * channel_w).mean(dim=2)
         fused = weighted + centers_feats
-        out = self.mlp(fused)  # (B,M,out_ch)
+        if Config.ENABLE_FEATURE_DROP:
+            fused = feature_dropout(fused, Config.FEATURE_DROP_PROB)
+        out = self.mlp(fused)
+        out = self.drop_path(out)
         return out, knn_idx
 
 class ChannelCCC(nn.Module):
@@ -119,12 +115,19 @@ class ChannelCCC(nn.Module):
         self.linear1 = nn.Linear(dim, hidden)
         self.linear2 = nn.Linear(hidden, dim)
         self.norm = nn.LayerNorm(dim)
+        self.dropout = Dropout(Config.DROPOUT_RATE) if Config.ENABLE_DROPOUT else nn.Identity()
+        self.drop_path = DropPath(Config.DROPPATH_PROB) if Config.ENABLE_DROPPATH else nn.Identity()
+
     def forward(self, x):
-        # x: (B,N,C)
         ch_desc = x.mean(dim=1)
         h = F.relu(self.linear1(ch_desc))
         att = torch.sigmoid(self.linear2(h)).unsqueeze(1)
-        return self.norm(x * att + x)
+        out = self.norm(x * att + x)
+        if Config.ENABLE_FEATURE_DROP:
+            out = feature_dropout(out, Config.FEATURE_DROP_PROB)
+        out = self.dropout(out)
+        out = self.drop_path(out)
+        return out
 
 class LinearSpatialGVA(nn.Module):
     """Linearized spatial aggregation with normalization to prevent explosion."""
@@ -134,21 +137,53 @@ class LinearSpatialGVA(nn.Module):
         self.q = nn.Linear(dim, kv_dim)
         self.k = nn.Linear(dim, kv_dim)
         self.v = nn.Linear(dim, dim)
+        self.dropout = Dropout(Config.DROPOUT_RATE) if Config.ENABLE_DROPOUT else nn.Identity()
+        self.drop_path = DropPath(Config.DROPPATH_PROB) if Config.ENABLE_DROPPATH else nn.Identity()
 
     def forward(self, x):
         B, N, C = x.shape
-        Q = self.q(x)  # (B,N,kv)
-        K = self.k(x)  # (B,N,kv)
-        V = self.v(x)  # (B,N,C)
+        Q = self.q(x)
+        K = self.k(x)
+        V = self.v(x)
 
-        # KV aggregation, normalized by N to avoid large magnitudes
-        KV = torch.einsum('bnd,bnc->bdc', K, V) / max(1, N)  # (B,kv,C)
-        out = torch.einsum('bnd,bdc->bnc', Q, KV)  # (B,N,C)
+        KV = torch.einsum('bnd,bnc->bdc', K, V) / max(1, N)
+        out = torch.einsum('bnd,bdc->bnc', Q, KV)
 
-        Ksum = K.sum(dim=1, keepdim=True)  # (B,1,kv)
-        denom = (Q * Ksum).sum(dim=-1, keepdim=True).clamp(min=1e-3)  # (B,N,1) -- more conservative eps
+        Ksum = K.sum(dim=1, keepdim=True)
+        denom = (Q * Ksum).sum(dim=-1, keepdim=True).clamp(min=1e-3)
 
         out = out / denom
-        # protect from NaN/Inf
         out = torch.nan_to_num(out, nan=0.0, posinf=1e6, neginf=-1e6)
+        if Config.ENABLE_FEATURE_DROP:
+            out = feature_dropout(out, Config.FEATURE_DROP_PROB)
+        out = self.dropout(out)
+        out = self.drop_path(out)
         return out
+
+# -----------------------------
+# DropPath / Stochastic Depth
+# -----------------------------
+def drop_path(x, drop_prob: float = 0.0, training: bool = False):
+    if drop_prob == 0.0 or not training:
+        return x
+    keep_prob = 1.0 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()
+    return x.div(keep_prob) * random_tensor
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
+# -----------------------------
+# Feature Dropout
+# -----------------------------
+def feature_dropout(x, drop_prob=0.1):
+    if drop_prob > 0 and x.requires_grad and random.random() < drop_prob:
+        drop_mask = torch.rand_like(x) > drop_prob
+        return x * drop_mask
+    return x

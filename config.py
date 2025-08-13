@@ -1,47 +1,68 @@
 import os
 import datetime
+import torch
 
-# 1111
 class Config:
-    def __init__(self):
-        # 数据路径
-        self.DATA_ROOT = "/root/my/point/data/tower"
-        self.TRAIN_DIR = os.path.join(self.DATA_ROOT, "train")
-        self.VAL_DIR = os.path.join(self.DATA_ROOT, "val")
+    # ================== 数据路径 ==================
+    DATA_ROOT = "/root/my/point/data/tower"
+    TRAIN_DIR = os.path.join(DATA_ROOT, "train")
+    VAL_DIR = os.path.join(DATA_ROOT, "val")
 
-        # 模型与训练参数
-        self.NUM_CLASSES = 3
-        self.BATCH_SIZE = 1
-        self.LEARNING_RATE = 1e-3
-        self.WEIGHT_DECAY = 1e-5
-        self.MAX_EPOCHS = 100
-        self.EVAL_FREQ = 5
-        self.SAVE_FREQ = 10
-        self.DEVICE = "cuda"
+    # ================== 模型参数 ==================
+    NUM_CLASSES = 3
+    BATCH_SIZE = 1
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-5
+    MAX_EPOCHS = 100
+    EVAL_FREQ = 5
+    SAVE_FREQ = 10
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # 新增参数：是否限制每个样本的点数
-        self.LIMIT_POINTS = False
-        self.MAX_POINTS = 8000  # 仅当 LIMIT_POINTS=True 时生效
+    # 限制每个样本点数
+    LIMIT_POINTS = True
+    MAX_POINTS = 8000
 
-        # 数据增强
-        self.ROTATION_AUG = True
-        self.SCALE_AUG = True
-        self.NOISE_AUG = True
-        self.TRANSFORM_AUG = True
+    # 数据增强
+    ROTATION_AUG = True
+    SCALE_AUG = True
+    NOISE_AUG = True
+    TRANSFORM_AUG = True
 
-        # 训练辅助
-        self.LOG_FREQ = 10
-        self.CLIP_NORM = 2.0
-        self.NUM_WORKERS = 4
+    # 日志与保存路径
+    LOG_FREQ = 10
+    CLIP_NORM = 2.0
+    NUM_WORKERS = 4
+    LOG_DIR = f"logs/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    MODEL_SAVE_DIR = f"checkpoints/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-        # 日志 & 模型保存路径
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.LOG_DIR = os.path.join("logs", timestamp)
-        self.MODEL_SAVE_DIR = os.path.join("checkpoints", timestamp)
+    # ================== 反过拟合策略开关 ==================
+    ENABLE_DROPOUT = True  # 控制Dropout
+    DROPOUT_RATE = 0.3
+
+    ENABLE_DROPPATH = True  # 控制DropPath
+    DROPPATH_PROB = 0.1
+
+    ENABLE_FEATURE_DROP = True  # 随机丢弃特征
+    FEATURE_DROP_PROB = 0.15
+
+    ENABLE_LABEL_SMOOTH = True  # 标签平滑
+    LABEL_SMOOTH_FACTOR = 0.1
+
+    ENABLE_FOCAL_LOSS = True  # Focal Loss
+    FOCAL_GAMMA = 2.0
+    FOCAL_ALPHA = 0.25
+
+    ENABLE_TEMP_SCALING = True  # 温度缩放
+    TEMP_FACTOR = 1.5
+
 
     def print_config(self):
-        print("=" * 50)
+        print("==================================================")
         print("训练配置:")
-        for k, v in self.__dict__.items():
+        for k, v in vars(self).items():
+            if k.startswith("_"):  # 跳过私有
+                continue
+            if callable(v):
+                continue
             print(f"{k}: {v}")
-        print("=" * 50)
+        print("==================================================")
