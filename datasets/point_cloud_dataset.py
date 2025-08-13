@@ -12,11 +12,12 @@ class PointCloudDataset(Dataset):
       - normal.npy  (N,3)
       - segment20.npy (N,)  # label, 取值 {0..K-1}，无 pad；pad 在 collate 里补 -1
     """
-    def __init__(self, root_dir, split="train",
+
+    def __init__(self, data_root, split="train",
                  rotation=False, scale=False, noise=False, translate=False,
                  limit_points=True, max_points=20000, normalize=True, num_classes=None):
         super().__init__()
-        self.root_dir = os.path.join(root_dir, split)
+        self.root_dir = os.path.join(data_root, split)
         self.scene_list = [os.path.join(self.root_dir, s) for s in sorted(os.listdir(self.root_dir))]
         self.rotation = rotation
         self.scale = scale
