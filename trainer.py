@@ -449,7 +449,9 @@ class Trainer:
                         break
                 if not grads_finite:
                     self.logger.warning("[SkipStep] 梯度出现 NaN/Inf，跳过该步更新。")
+                    # 清梯度并推进 scaler 状态，避免下一步再次调用 unscale_ 报错
                     self.optimizer.zero_grad(set_to_none=True)
+                    self.scaler.update()  # ★ 关键修复：推进 AMP 内部状态
                 else:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
@@ -627,7 +629,7 @@ class Trainer:
         self.logger.info(msg)
 
         # 打印 per-class IoU（仅展示出现过的类为主）
-        present = [c for c in per_class_iou.items() if c[1] > 0]
+        present = [c for c, v in per_class_iou.items() if v > 0]
         print("[IoU per class]")
         for cls in range(self.config.NUM_CLASSES):
             print(f"  [IoU] class {cls}: {per_class_iou.get(cls, 0.0):.4f}")
