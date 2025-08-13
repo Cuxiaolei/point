@@ -24,7 +24,7 @@ class PointCloudDataset(Dataset):
         self.noise = noise
         self.translate = translate
         self.limit_points = limit_points
-        self.max_points = max_points
+        self.max_points = max_points if (limit_points and max_points is not None) else None
         self.normalize = normalize
         self.num_classes = num_classes  # 用于检查标签合法性
 
@@ -83,7 +83,7 @@ class PointCloudDataset(Dataset):
         pts = np.concatenate([coord, color, normal], axis=1).astype(np.float32)  # (N,9)
 
         # 限制点数
-        if self.limit_points and pts.shape[0] > self.max_points:
+        if self.limit_points and self.max_points is not None and pts.shape[0] > self.max_points:
             choice = np.random.choice(pts.shape[0], self.max_points, replace=False)
             pts = pts[choice]
             label = label[choice]
