@@ -294,44 +294,56 @@ class SGDAT(nn.Module):
         return logits
 
     def get_loss(
-        self,
-        points,
-        labels,
-        class_weights=None,
-        ignore_index=-1,
-        aux_weight=None,
-        reduction='mean',
-        label_smoothing: float = 0.0,
-        focal_gamma: float = 0.0,
-        **kwargs
+            self,
+            points,
+            labels,
+            class_weights=None,
+            ignore_index=-1,
+            aux_weight=None,
+            reduction='mean',
+            label_smoothing: float = 0.0,
+            focal_gamma: float = 0.0,
+            **kwargs
     ):
         logits = self.forward(points)  # (B,N,K)
+
+        # ===== Debug 1: 检查 logits =====
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            print("[NaN Debug] NaN/Inf detected in logits, fixing...")
+            logits = torch.nan_to_num(logits)
+
         B, N, K = logits.shape
         labels = labels.view(B, N)
-
         valid_mask = labels != ignore_index
+
         if valid_mask.sum() == 0:
             loss = logits.new_tensor(0.0, requires_grad=True)
             with torch.no_grad():
                 acc = logits.new_tensor(0.0)
-            stats = {
-                "loss": float(loss.detach().item()),
-                "acc": float(acc.detach().item()),
-                "valid_points": int(valid_mask.sum().item())
-            }
+            stats = {"loss": float(loss.item()), "acc": float(acc.item()), "valid_points": 0}
             return loss, logits, stats
 
         logits_valid = logits[valid_mask]
         labels_valid = labels[valid_mask]
 
+        # ===== Debug 2: 检查 logits_valid =====
+        if torch.isnan(logits_valid).any() or torch.isinf(logits_valid).any():
+            print("[NaN Debug] NaN/Inf detected in logits_valid, fixing...")
+            logits_valid = torch.nan_to_num(logits_valid)
+
         weight = None
         if class_weights is not None:
-            if isinstance(class_weights, torch.Tensor):
-                weight = class_weights.to(logits.device, dtype=logits.dtype)
-            else:
-                weight = torch.tensor(class_weights, dtype=logits.dtype, device=logits.device)
+            weight = (class_weights.to(logits.device, dtype=logits.dtype)
+                      if isinstance(class_weights, torch.Tensor)
+                      else torch.tensor(class_weights, dtype=logits.dtype, device=logits.device))
 
         log_probs = F.log_softmax(logits_valid, dim=-1)
+
+        # ===== Debug 3: 检查 log_probs =====
+        if torch.isnan(log_probs).any() or torch.isinf(log_probs).any():
+            print("[NaN Debug] NaN/Inf detected in log_probs, fixing...")
+            log_probs = torch.nan_to_num(log_probs)
+
         probs = log_probs.exp()
 
         if label_smoothing is not None and label_smoothing > 0.0:
@@ -352,6 +364,9 @@ class SGDAT(nn.Module):
         if focal_gamma is not None and focal_gamma > 0.0:
             gamma = float(focal_gamma)
             pt = (true_dist * probs).sum(dim=-1).clamp(min=1e-6, max=1.0)
+            if torch.isnan(pt).any() or torch.isinf(pt).any():
+                print("[NaN Debug] NaN/Inf detected in pt, fixing...")
+                pt = torch.nan_to_num(pt)
             focal_weight = (1.0 - pt) ** gamma
             ce = focal_weight * ce
 
@@ -362,10 +377,12 @@ class SGDAT(nn.Module):
         else:
             loss_main = ce
 
-        if aux_weight is not None and aux_weight != 0:
-            loss = loss_main * (1 - aux_weight)
-        else:
-            loss = loss_main
+        loss = loss_main if aux_weight is None else loss_main * (1 - aux_weight)
+
+        # ===== Debug 4: 检查 loss =====
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            print("[NaN Debug] NaN/Inf detected in final loss, fixing...")
+            loss = torch.nan_to_num(loss)
 
         with torch.no_grad():
             pred = logits_valid.argmax(dim=-1)
@@ -378,3 +395,4 @@ class SGDAT(nn.Module):
             "valid_points": int(valid_mask.sum().item())
         }
         return loss, logits, stats
+
