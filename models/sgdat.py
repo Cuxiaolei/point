@@ -246,19 +246,17 @@ class SGDAT(nn.Module):
 
         return logits
 
-    def get_loss(self, points, labels, class_weights=None, ignore_index=-1, reduction='mean'):
+    def get_loss(self, points, labels, class_weights=None, ignore_index=-1, aux_weight=None, reduction='mean', **kwargs):
         """
         points: (B, N, 9)
-        labels: (B, N)  值域：[0..K-1]，无效点为 ignore_index (默认 -1)
+        labels: (B, N)
         """
-        logits = self.forward(points)                                  # (B,N,K)
+        logits = self.forward(points)  # (B,N,K)
         B, N, K = logits.shape
         labels = labels.view(B, N)
 
-        # 只在有效点上计算损失
         valid_mask = labels != ignore_index
         if valid_mask.sum() == 0:
-            # 没有有效点，返回 0 loss，避免 NaN
             loss = logits.new_tensor(0.0, requires_grad=True)
             with torch.no_grad():
                 acc = logits.new_tensor(0.0)
@@ -269,8 +267,8 @@ class SGDAT(nn.Module):
             }
             return loss, logits, stats
 
-        logits_valid = logits[valid_mask]                               # (Nv, K)
-        labels_valid = labels[valid_mask]                               # (Nv,)
+        logits_valid = logits[valid_mask]
+        labels_valid = labels[valid_mask]
 
         weight = None
         if class_weights is not None:
@@ -279,14 +277,19 @@ class SGDAT(nn.Module):
             else:
                 weight = torch.tensor(class_weights, dtype=logits.dtype, device=logits.device)
 
-        loss = F.cross_entropy(
+        loss_main = F.cross_entropy(
             logits_valid,
             labels_valid,
             weight=weight,
             reduction=reduction
         )
 
-        # 计算精度（有效点）
+        # 预留辅助损失接口（即使现在不用，也不会报错）
+        if aux_weight is not None and aux_weight != 0:
+            loss = loss_main * (1 - aux_weight)  # 暂时简单处理
+        else:
+            loss = loss_main
+
         with torch.no_grad():
             pred = logits_valid.argmax(dim=-1)
             correct = (pred == labels_valid).sum()
