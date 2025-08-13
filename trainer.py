@@ -1,4 +1,3 @@
-# trainer.py
 import os
 import torch
 import torch.optim as optim
@@ -9,6 +8,7 @@ from tqdm import tqdm
 from sklearn.metrics import confusion_matrix
 from torch.amp import GradScaler, autocast
 import torch.nn.utils as nn_utils
+from tabulate import tabulate  # 新增
 
 class Trainer:
     """
@@ -26,6 +26,17 @@ class Trainer:
         self.val_dataset = val_dataset
         self.device = config.DEVICE
 
+        # 历史记录（新增）
+        self.history = {
+            "epoch": [],
+            "train_loss": [],
+            "train_acc": [],
+            "train_miou": [],
+            "val_loss": [],
+            "val_acc": [],
+            "val_miou": []
+        }
+
         # 如果传入了 class_weights，就放到 GPU
         if class_weights is not None:
             if isinstance(class_weights, torch.Tensor):
@@ -37,8 +48,6 @@ class Trainer:
 
         # AMP scaler（在 cuda 时启用）
         self.scaler = GradScaler() if self.device.startswith('cuda') else None
-
-
 
         # 最大点数来自 dataset（默认回退）
         self.max_points = getattr(train_dataset, 'max_points', 20000)
@@ -144,7 +153,6 @@ class Trainer:
             labels = labels.to(self.device, non_blocking=True)
 
             self.optimizer.zero_grad()
-            # forward + loss (with AMP)
             with autocast(device_type='cuda', enabled=self.scaler is not None):
                 loss, logits, stats = self.model.get_loss(
                     points, labels,
@@ -152,19 +160,16 @@ class Trainer:
                     ignore_index=-1,
                     aux_weight=0.4,
                     label_smoothing=0.05,
-                    focal_gamma=1.5,  # 如需更平稳，先设 0 试试；类别极不均衡可 >=1
+                    focal_gamma=1.5,
                 )
 
-            # numeric check
             if torch.isnan(loss) or torch.isinf(loss):
                 save_path = os.path.join(self.config.MODEL_SAVE_DIR, f"bad_loss_epoch{epoch}_batch{batch_idx}.pth")
                 torch.save(self.model.state_dict(), save_path)
                 raise RuntimeError(f"Encountered bad loss (NaN/Inf) at epoch {epoch} batch {batch_idx}. Model saved to {save_path}")
 
-            # backward
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
-                # gradient clipping
                 self.scaler.unscale_(self.optimizer)
                 nn_utils.clip_grad_norm_(self.model.parameters(), self.clip_norm)
                 self.scaler.step(self.optimizer)
@@ -174,10 +179,8 @@ class Trainer:
                 nn_utils.clip_grad_norm_(self.model.parameters(), self.clip_norm)
                 self.optimizer.step()
 
-            # metrics (exclude padded labels -1)
             mask = (labels != -1)
             if mask.sum() == 0:
-                # no valid points (should not happen often)
                 pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": "N/A", "有效点": 0})
                 continue
 
@@ -195,12 +198,10 @@ class Trainer:
                     "有效点": f"{mask.sum().item()}"
                 })
 
-            # write to tensorboard
             global_step = epoch * len(self.train_loader) + batch_idx
             self.writer.add_scalar("train/batch_loss", loss.item(), global_step)
             self.writer.add_scalar("train/batch_acc", correct / mask.sum().item(), global_step)
 
-            # free mem
             del points, labels, loss, logits, preds, mask
             if self.device.startswith('cuda'):
                 torch.cuda.empty_cache()
@@ -219,8 +220,6 @@ class Trainer:
         total_loss = 0.0
         total_correct = 0
         total_points = 0
-
-        # containers for preds/labels to compute per-class IoU and distributions
         all_preds = []
         all_labels = []
 
@@ -240,8 +239,8 @@ class Trainer:
                         class_weights=self.class_weights if hasattr(self, 'class_weights') else None,
                         ignore_index=-1,
                         aux_weight=0.4,
-                        label_smoothing=0.0,  # 验证不做 smoothing
-                        focal_gamma=0.0  # 验证不做 focal
+                        label_smoothing=0.0,
+                        focal_gamma=0.0
                     )
 
                 preds = logits.argmax(dim=-1)
@@ -255,7 +254,6 @@ class Trainer:
                 total_points += mask.sum().item()
                 total_loss += loss.item()
 
-                # collect preds/labels for global confusion
                 batch_labels = labels[mask].cpu().numpy().flatten()
                 batch_preds = preds[mask].cpu().numpy().flatten()
                 all_labels.append(batch_labels)
@@ -268,12 +266,10 @@ class Trainer:
                     "有效点": f"{mask.sum().item()}"
                 })
 
-                # free mem
                 del points, labels, loss, logits, preds, mask
                 if self.device.startswith('cuda'):
                     torch.cuda.empty_cache()
 
-        # concat arrays
         if len(all_labels) > 0:
             all_labels = np.concatenate(all_labels)
             all_preds = np.concatenate(all_preds)
@@ -281,12 +277,10 @@ class Trainer:
             all_labels = np.array([], dtype=np.int32)
             all_preds = np.array([], dtype=np.int32)
 
-        # global confusion
         conf_matrix = np.zeros((self.config.NUM_CLASSES, self.config.NUM_CLASSES), dtype=np.int64)
         if all_labels.size > 0:
             conf_matrix = confusion_matrix(all_labels, all_preds, labels=np.arange(self.config.NUM_CLASSES))
 
-        # compute IoUs only over classes that appear in GT
         per_class_iou = {}
         present = []
         for cls in range(self.config.NUM_CLASSES):
@@ -299,30 +293,22 @@ class Trainer:
                 per_class_iou[cls] = float(iou)
                 present.append(cls)
             else:
-                per_class_iou[cls] = 0.0  # not present
+                per_class_iou[cls] = 0.0
 
-        # mIoU over present classes
-        if len(present) > 0:
-            miou = float(np.mean([per_class_iou[c] for c in present]))
-        else:
-            miou = 0.0
-
+        miou = float(np.mean([per_class_iou[c] for c in present])) if len(present) > 0 else 0.0
         val_loss = total_loss / len(self.val_loader) if len(self.val_loader) > 0 else 0.0
         val_acc = total_correct / total_points if total_points > 0 else 0.0
 
-        # logging
         self.writer.add_scalar("val/epoch_loss", val_loss, epoch)
         self.writer.add_scalar("val/epoch_acc", val_acc, epoch)
         self.writer.add_scalar("val/mIoU", miou, epoch)
 
-        # print per-class IoU summary & distributions
         print(f"验证轮次 {epoch}：损失 = {val_loss:.4f}, 准确率 = {val_acc:.4f}, mIoU = {miou:.4f}")
         print("[IoU per class]")
         for cls in range(self.config.NUM_CLASSES):
             if per_class_iou[cls] > 0 or cls in present:
                 print(f"  [IoU] class {cls}: {per_class_iou[cls]:.4f}")
 
-        # print prediction / GT distribution summary (top classes)
         if all_preds.size > 0:
             unique_preds, counts_preds = np.unique(all_preds, return_counts=True)
             print("Prediction distribution (val):", dict(zip(unique_preds.tolist(), counts_preds.tolist())))
@@ -338,11 +324,10 @@ class Trainer:
             for epoch in range(1, self.config.MAX_EPOCHS + 1):
                 train_loss, train_acc = self.train_epoch(epoch)
 
-                # scheduler
                 self.scheduler.step()
                 self.writer.add_scalar("lr", self.optimizer.param_groups[0]["lr"], epoch)
 
-                # validate periodically
+                val_loss, val_acc, val_miou = float('nan'), float('nan'), float('nan')
                 if epoch % self.config.EVAL_FREQ == 0:
                     val_loss, val_acc, val_miou = self.validate(epoch)
                     if val_miou > self.best_val_miou:
@@ -356,7 +341,6 @@ class Trainer:
                         }, save_path)
                         print(f"保存最佳模型到 {save_path}，mIoU = {val_miou:.4f}")
 
-                # periodic save
                 if epoch % self.config.SAVE_FREQ == 0:
                     save_path = os.path.join(self.config.MODEL_SAVE_DIR, f"model_epoch_{epoch}.pth")
                     torch.save({
@@ -366,14 +350,47 @@ class Trainer:
                     }, save_path)
                     print(f"保存模型到 {save_path}")
 
+                # 记录历史
+                self.history["epoch"].append(epoch)
+                self.history["train_loss"].append(train_loss)
+                self.history["train_acc"].append(train_acc)
+                self.history["train_miou"].append(float('nan'))  # 如果有训练mIoU可替换
+                self.history["val_loss"].append(val_loss)
+                self.history["val_acc"].append(val_acc)
+                self.history["val_miou"].append(val_miou)
+
         except Exception as e:
-            # save snapshot on exception
             error_save_path = os.path.join(self.config.MODEL_SAVE_DIR, f"error_model_epoch_{epoch}.pth")
             torch.save(self.model.state_dict(), error_save_path)
             print(f"训练中断，已保存当前模型到 {error_save_path}")
             raise e
 
-        # final validate
         val_loss, val_acc, val_miou = self.validate(self.config.MAX_EPOCHS)
         print(f"训练完成！最佳验证mIoU = {self.best_val_miou:.4f}")
+
+        # 打印与保存总结
+        self.print_summary()
+
         self.writer.close()
+
+    def print_summary(self):
+        """打印并保存训练/验证指标表格"""
+        headers = ["Epoch", "Train Loss", "Train Acc", "Train mIoU", "Val Loss", "Val Acc", "Val mIoU"]
+        table_data = []
+        for i in range(len(self.history["epoch"])):
+            table_data.append([
+                self.history["epoch"][i],
+                f"{self.history['train_loss'][i]:.4f}" if not np.isnan(self.history['train_loss'][i]) else "-",
+                f"{self.history['train_acc'][i]:.4f}" if not np.isnan(self.history['train_acc'][i]) else "-",
+                f"{self.history['train_miou'][i]:.4f}" if not np.isnan(self.history['train_miou'][i]) else "-",
+                f"{self.history['val_loss'][i]:.4f}" if not np.isnan(self.history['val_loss'][i]) else "-",
+                f"{self.history['val_acc'][i]:.4f}" if not np.isnan(self.history['val_acc'][i]) else "-",
+                f"{self.history['val_miou'][i]:.4f}" if not np.isnan(self.history['val_miou'][i]) else "-"
+            ])
+        summary_str = tabulate(table_data, headers=headers, tablefmt="grid")
+        print("\n训练结果总结：\n")
+        print(summary_str)
+        log_path = os.path.join(self.config.LOG_DIR, "summary.txt")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(summary_str)
+        print(f"\n训练总结已保存到: {log_path}")
