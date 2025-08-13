@@ -1,250 +1,327 @@
-import math
+# models/sgdat.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --------- 工具 ---------
-def farthest_point_sample(x, m):  # x:(B,N,3) -> (B,m)
-    # 朴素版 FPS，B 小时够用；若想提速可换 CUDA 实现
-    B, N, _ = x.shape
-    centroids = torch.zeros(B, m, dtype=torch.long, device=x.device)
-    distance = torch.full((B, N), 1e10, device=x.device)
-    farthest = torch.randint(0, N, (B,), device=x.device)
-    batch_indices = torch.arange(B, device=x.device)
+
+# -------------------------
+# 工具函数：最远点采样（GPU 上运行）
+# -------------------------
+@torch.no_grad()
+def farthest_point_sample(xyz: torch.Tensor, m: int):
+    """
+    批量最远点采样 (B, N, 3) -> (B, m)
+    说明：
+      - 使用纯 PyTorch 张量运算；当 xyz 在 cuda 上时，计算在 GPU 上进行
+      - 与常见的 CUDA Kernel FPS 相比略慢，但无需编译，且对 N=8k, m<=512/1024 可接受
+    """
+    assert xyz.ndim == 3 and xyz.size(-1) == 3, "fps 输入应为 (B, N, 3)"
+    device = xyz.device
+    B, N, _ = xyz.shape
+    m = min(m, N)
+
+    centroids = torch.zeros(B, m, dtype=torch.long, device=device)
+    # 初始化为 +inf
+    distances = torch.full((B, N), float("inf"), device=device)
+
+    # 随机选择一个起始点（你也可以选择几何中心最近点等别的策略）
+    farthest = torch.randint(0, N, (B,), device=device)
+
+    batch_indices = torch.arange(B, dtype=torch.long, device=device)
+
     for i in range(m):
         centroids[:, i] = farthest
-        centroid = x[batch_indices, farthest, :].view(B, 1, 3)
-        dist = torch.sum((x - centroid) ** 2, -1)
-        mask = dist < distance
-        distance[mask] = dist[mask]
-        farthest = torch.max(distance, -1)[1]
-    return centroids  # (B,m)
+        # 当前最远点的坐标
+        centroid_xyz = xyz[batch_indices, farthest, :].view(B, 1, 3)  # (B,1,3)
+        # 计算到所有点的欧氏距离的平方
+        dist = torch.sum((xyz - centroid_xyz) ** 2, dim=-1)  # (B,N)
+        # 维护最近距离
+        mask = dist < distances
+        distances[mask] = dist[mask]
+        # 选择全局最远的最近距离点
+        farthest = torch.max(distances, dim=1).indices
 
-def knn(center, points, k):  # center:(B,M,3) points:(B,N,3) -> idx:(B,M,k)
-    # 基于欧式距离的 KNN
-    with torch.no_grad():
-        dist = torch.cdist(center, points)  # (B,M,N)
-        idx = torch.topk(dist, k=k, dim=-1, largest=False)[1]  # (B,M,k)
+    return centroids  # (B, m)
+
+
+# -------------------------
+# 工具函数：批量 kNN（GPU 上运行）
+# -------------------------
+@torch.no_grad()
+def knn_indices(query_xyz: torch.Tensor, ref_xyz: torch.Tensor, k: int):
+    """
+    在 ref_xyz 中检索 query_xyz 的 kNN
+    query_xyz: (B, Q, 3)
+    ref_xyz:   (B, N, 3)
+    返回 idx:   (B, Q, k)
+    """
+    B, Q, _ = query_xyz.shape
+    _, N, _ = ref_xyz.shape
+    k = min(k, N)
+    # pairwise 距离 (B, Q, N)
+    # 注意：torch.cdist 在 GPU 上也很快
+    dists = torch.cdist(query_xyz, ref_xyz, p=2)  # (B,Q,N)
+    # 取最小的 k 个
+    idx = torch.topk(dists, k=k, dim=-1, largest=False).indices  # (B,Q,k)
     return idx
 
-def index_points(points, idx):  # points:(B,N,C), idx:(B,M) or (B,M,k)
+
+def batched_index_points(points: torch.Tensor, idx: torch.Tensor):
+    """
+    根据批量索引提取点/特征
+    points: (B, N, C)
+    idx:    (B, M, k) 或 (B, M)
+    return: (B, M, k, C) 或 (B, M, C)
+    """
     B = points.shape[0]
-    view_shape = list(idx.shape)
-    view_shape.append(points.shape[-1])
-    batch_indices = torch.arange(B, device=points.device).view(B, 1, 1).expand(*idx.shape[:2], 1)
-    if idx.dim() == 2:
-        return points[torch.arange(B).unsqueeze(-1), idx]  # (B,M,C)
+    batch_indices = torch.arange(B, dtype=torch.long, device=points.device).view(B, 1, 1)
+    if idx.ndim == 3:
+        B, M, K = idx.shape
+        batch_indices = batch_indices.expand(-1, M, K)
+        return points[batch_indices, idx, :]
     else:
-        batch_indices = torch.arange(B, device=points.device).view(B, 1, 1).expand(B, idx.shape[1], idx.shape[2])
-        return points[batch_indices, idx]  # (B,M,k,C)
+        B, M = idx.shape
+        batch_indices = batch_indices.expand(-1, M)
+        return points[batch_indices, idx, :]
 
-# --------- 层 ---------
-class MLP1d(nn.Module):
-    def __init__(self, in_c, out_c, p=0.0):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_c, out_c),
-            nn.SiLU(inplace=True),
-            nn.LayerNorm(out_c),
-            nn.Dropout(p),
-            nn.Linear(out_c, out_c),
-            nn.SiLU(inplace=True),
-            nn.LayerNorm(out_c),
-            nn.Dropout(p),
-        )
-    def forward(self, x):  # (B,*,C)
-        return self.net(x)
 
-class NeighborhoodFuse(nn.Module):
-    """
-    将中心点与其 kNN 邻域做特征融合：
-      输入: centers (B,M,3), feats (B,N,F), points (B,N,3), knn_idx (B,M,k)
-      融合: [center_feat, neighbor_feat-center_feat, pos_delta]
-      输出: (B,M,out_dim)
-    """
-    def __init__(self, in_feat, out_feat, k=16, p=0.0):
+# -------------------------
+# 小模块：简单的 EdgeConv / 局部聚合
+# -------------------------
+class LocalAgg(nn.Module):
+    def __init__(self, in_ch, out_ch, k=16):
         super().__init__()
         self.k = k
-        self.mlp = MLP1d(in_feat + in_feat + 3, out_feat, p=p)
-        self.proj = nn.Linear(out_feat, out_feat)
+        # EdgeConv 风格：phi([x_i, x_j - x_i])
+        self.mlp = nn.Sequential(
+            nn.Conv2d(in_ch * 2, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
 
-    def forward(self, centers_xyz, feats, points_xyz, knn_idx):
-        # feats:(B,N,F), points_xyz:(B,N,3)
-        B, M, _ = centers_xyz.shape
-        k = self.k
-        # 取邻域
-        neigh_xyz = index_points(points_xyz, knn_idx)           # (B,M,k,3)
-        neigh_feat = index_points(feats, knn_idx)               # (B,M,k,F)
-        # 中心对应的特征
-        # 先找每个 centers_xyz 在 points_xyz 中的最近点索引用于取中心特征
-        with torch.no_grad():
-            nn_idx = torch.cdist(centers_xyz, points_xyz).argmin(dim=-1)  # (B,M)
-        center_feat = index_points(feats, nn_idx)               # (B,M,F)
-        center_feat_exp = center_feat.unsqueeze(2).expand(B, M, k, center_feat.shape[-1])
+    def forward(self, feats: torch.Tensor, xyz: torch.Tensor):
+        """
+        feats: (B, N, C)
+        xyz:   (B, N, 3)
+        返回:  (B, N, out_ch)
+        """
+        B, N, C = feats.shape
+        k = min(self.k, N)
+        idx = knn_indices(xyz, xyz, k)  # (B,N,k)
 
-        pos_delta = neigh_xyz - centers_xyz.unsqueeze(2)        # (B,M,k,3)
-        fuse = torch.cat([center_feat_exp, neigh_feat - center_feat_exp, pos_delta], dim=-1)  # (B,M,k, 2F+3)
-        fuse = self.mlp(fuse)                                   # (B,M,k,out)
-        fuse = fuse.mean(dim=2)                                 # (B,M,out)
-        return self.proj(fuse)                                  # (B,M,out)
+        # 中心特征与邻域特征
+        neighbor = batched_index_points(feats, idx)          # (B,N,k,C)
+        center = feats.unsqueeze(2).expand(-1, -1, k, -1)    # (B,N,k,C)
+        edge = torch.cat([center, neighbor - center], dim=-1)  # (B,N,k,2C)
 
-# --------- 主模型 ---------
+        # 转为 conv2d 需要的 [B, C, N, k]
+        edge = edge.permute(0, 3, 1, 2).contiguous()  # (B,2C,N,k)
+        out = self.mlp(edge)                          # (B,out_ch,N,k)
+        out = torch.max(out, dim=-1).values           # (B,out_ch,N)
+        out = out.permute(0, 2, 1).contiguous()       # (B,N,out_ch)
+        return out
+
+
+# -------------------------
+# 上采样（基于 最近邻/三邻居插值）
+# -------------------------
+def three_nn_interpolate(xyz_src, xyz_dst, feat_src):
+    """
+    把 src 的特征插值到 dst（3-NN 权重插值）
+    xyz_src:  (B, N1, 3)
+    xyz_dst:  (B, N2, 3)
+    feat_src: (B, N1, C)
+    返回:     (B, N2, C)
+    """
+    B, N2, _ = xyz_dst.shape
+    # 找到 dst 在 src 的 3 个近邻
+    idx = knn_indices(xyz_dst, xyz_src, k=3)  # (B,N2,3)
+    neighbor = batched_index_points(xyz_src, idx)  # (B,N2,3,3)
+    dist = torch.norm(neighbor - xyz_dst.unsqueeze(2), dim=-1) + 1e-8  # (B,N2,3)
+
+    inv = 1.0 / dist
+    weights = inv / torch.sum(inv, dim=-1, keepdim=True)  # 归一化权重 (B,N2,3)
+
+    src_feat_knn = batched_index_points(feat_src, idx)  # (B,N2,3,C)
+    out = torch.sum(src_feat_knn * weights.unsqueeze(-1), dim=2)  # (B,N2,C)
+    return out
+
+
+# -------------------------
+# 主模型：SGDAT（简洁稳定版）
+# -------------------------
 class SGDAT(nn.Module):
-    def __init__(self,
-                 num_classes: int,
-                 k: int = 16,
-                 m1: int = 512,
-                 m2: int = 128,
-                 base_dim: int = 64,
-                 dropout: float = 0.1):
+    def __init__(self, num_classes: int, base_dim: int = 64,
+                 max_points: int = 8000, k: int = 16, debug: bool = False):
         super().__init__()
         self.num_classes = num_classes
+        self.base = base_dim
+        self.max_points = max_points
         self.k = k
-        self.m1 = m1
-        self.m2 = m2
+        self.debug = debug
 
-        # 初始点特征（只用坐标）
-        self.stem = nn.Sequential(
-            nn.Linear(3, base_dim),
-            nn.SiLU(inplace=True),
-            nn.LayerNorm(base_dim)
+        # -------- 输入处理：坐标归一化 + 线性投影  --------
+        # 输入特征：9 维（xyz + rgb + normal），但也兼容 C!=9（会自动适配）
+        # 这里先用一个 1x1 卷积把输入映射到 base 维
+        self.in_proj = nn.Sequential(
+            nn.Conv1d(in_channels=9, out_channels=self.base, kernel_size=1, bias=False),
+            nn.BatchNorm1d(self.base),
+            nn.ReLU(inplace=True)
         )
 
-        # 两级融合
-        self.fuse1 = NeighborhoodFuse(base_dim, base_dim, k=k, p=dropout)  # (B,m1,base_dim)
-        self.fuse2 = NeighborhoodFuse(base_dim, base_dim, k=k, p=dropout)  # (B,m2,base_dim)
+        # -------- 层次编码：N -> 512 -> 128 --------
+        self.local1 = LocalAgg(in_ch=self.base, out_ch=self.base, k=self.k)          # N
+        self.local2 = LocalAgg(in_ch=self.base, out_ch=self.base * 2, k=self.k)      # 512
+        self.local3 = LocalAgg(in_ch=self.base * 2, out_ch=self.base * 2, k=self.k)  # 128
 
-        # 语义头（一级辅助 + 全局主头）
-        self.sem1_head = nn.Linear(base_dim, num_classes)   # (B,m1,C)
-        self.sem2_head = nn.Linear(base_dim, base_dim)      # 供上采样融合
-        self.main_head = nn.Sequential(
-            nn.Linear(base_dim, base_dim),
-            nn.SiLU(inplace=True),
-            nn.LayerNorm(base_dim),
-            nn.Dropout(dropout),
-            nn.Linear(base_dim, num_classes)
+        # 下采样后的特征压缩/融合
+        self.down1 = nn.Sequential(
+            nn.Conv1d(self.base * 2, self.base, 1, bias=False),
+            nn.BatchNorm1d(self.base),
+            nn.ReLU(inplace=True)
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv1d(self.base * 2, self.base * 2, 1, bias=False),
+            nn.BatchNorm1d(self.base * 2),
+            nn.ReLU(inplace=True)
         )
 
-        # 上采样时与原点拼接的 stem
-        self.back_proj = nn.Sequential(
-            nn.Linear(base_dim + base_dim, base_dim),
-            nn.SiLU(inplace=True),
-            nn.LayerNorm(base_dim)
+        # 上采样融合
+        self.up1 = nn.Sequential(  # 128 -> 512
+            nn.Conv1d(self.base * 3, self.base * 2, 1, bias=False),
+            nn.BatchNorm1d(self.base * 2),
+            nn.ReLU(inplace=True),
+        )
+        self.up2 = nn.Sequential(  # 512 -> N
+            nn.Conv1d(self.base * 3, self.base, 1, bias=False),
+            nn.BatchNorm1d(self.base),
+            nn.ReLU(inplace=True),
         )
 
-        self._reset_parameters()
+        # 语义分割头（每点分类）
+        self.head = nn.Sequential(
+            nn.Conv1d(self.base, self.base, 1, bias=False),
+            nn.BatchNorm1d(self.base),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.3),
+            nn.Conv1d(self.base, num_classes, 1, bias=True),
+        )
 
-    def _reset_parameters(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=0.02)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0.)
+        # 供 Trainer 注入的类别权重
+        self.class_weights = None
 
-    @torch.no_grad()
-    def _nearest_index(self, src_xyz, dst_xyz):
-        # 对 dst 中每个点，在 src 中找最近的点索引
-        # src:(B,Ms,3) dst:(B,N,3) -> idx:(B,N)
-        dist = torch.cdist(dst_xyz, src_xyz)   # (B,N,Ms)
-        idx = dist.argmin(dim=-1)              # (B,N)
-        return idx
-
-    def forward(self, points):
+    def _split_xyz_feat(self, x: torch.Tensor):
         """
-        points: (B,N,3)
-        return:
-          logits: (B,N,C)
-          aux: dict(sem1_logits:(B,m1,C), idx1:(B,m1), idx2:(B,m2))
+        x: (B, N, C) 期望 C>=3; 前 3 维是 xyz，其余视为特征
+        如果 C<9 也能工作，但推荐使用 9 维 (xyz+rgb+normal)
         """
-        B, N, _ = points.shape
-        xyz = points
+        assert x.ndim == 3 and x.size(-1) >= 3, "输入特征维度至少包含 xyz"
+        xyz = x[..., :3]
+        feat = x[..., 3:]
+        return xyz, feat
 
-        # stem
-        feats = self.stem(xyz)  # (B,N,F)
+    def forward(self, x: torch.Tensor):
+        """
+        x: (B, N, C)  — C 默认 9（xyz+rgb+normal）
+        return logits: (B, N, num_classes)
+        """
+        if self.debug and not hasattr(self, "_printed_shape"):
+            print(f"[DEBUG] Input shape: {x.shape}")
+            self._printed_shape = True
 
-        # FPS
-        idx1 = farthest_point_sample(xyz, self.m1)  # (B,m1)
-        centers1 = index_points(xyz, idx1)          # (B,m1,3)
-        knn1 = knn(centers1, xyz, self.k)           # (B,m1,k)
-        out1 = self.fuse1(centers1, feats, xyz, knn1)  # (B,m1,F)
-        sem1_logits = self.sem1_head(out1)          # (B,m1,C)
+        B, N, C = x.shape
+        device = x.device
 
-        # 第二级：在 out1 的中心再做 FPS
-        with torch.no_grad():
-            # 在 centers1 上再采样 m2
-            idx2_local = farthest_point_sample(centers1, self.m2)   # (B,m2) in local m1 index
-            idx2 = torch.gather(idx1, 1, idx2_local)                # (B,m2) map 回原 N 空间索引
-        centers2 = index_points(xyz, idx2)                          # (B,m2,3)
-        knn2 = knn(centers2, xyz, self.k)
-        out2 = self.fuse2(centers2, feats, xyz, knn2)               # (B,m2,F)
+        # 拆分坐标 / 特征，并对坐标做简单归一化（中心化 + 尺度归一）
+        xyz, attr = self._split_xyz_feat(x)  # (B,N,3), (B,N,C-3)
 
-        # 将 out2 上采样回 N（nearest）
-        with torch.no_grad():
-            nn2idx_full = self._nearest_index(centers2, xyz)        # (B,N)
-        up2 = index_points(out2, nn2idx_full)                       # (B,N,F)
+        xyz_mean = xyz.mean(dim=1, keepdim=True)
+        xyz_centered = xyz - xyz_mean
+        # 尺度：使用标准差（防止归一化过度）
+        xyz_std = torch.clamp(xyz_centered.std(dim=1, keepdim=True), min=1e-3)
+        xyz_normed = xyz_centered / xyz_std  # (B,N,3)
 
-        # 融合 + 主头
-        fused = self.back_proj(torch.cat([feats, up2], dim=-1))     # (B,N,F)
-        logits = self.main_head(fused)                              # (B,N,C)
+        # 准备 9 维输入：若 C==9 则直接用；否则拼接（xyz_normed + 原始 attr），并在不足 9 时补零
+        if C >= 9:
+            x9 = torch.cat([xyz_normed, x[..., 3:6], x[..., 6:9]], dim=-1)  # 安全地取到 9 维
+            x9 = x9[:, :, :9]  # 防止 C>9 时溢出
+        else:
+            # 不足 9 维时用 0 填充（仍然可跑，但建议你提供 9 维）
+            pad = torch.zeros(B, N, max(0, 9 - C), device=device, dtype=x.dtype)
+            x9 = torch.cat([x, pad], dim=-1)
 
-        # DEBUG（仅在训练初期）
-        if self.training:
-            for t, name in [(out1, "out1"), (out2, "out2"), (sem1_logits, "sem1_logits")]:
-                nans = torch.isnan(t).any().item()
-                infs = torch.isinf(t).any().item()
-                if nans or infs:
-                    raise RuntimeError(f"[NaN/Inf] {name} has NaN={nans}, Inf={infs}")
-        return logits, {"sem1_logits": sem1_logits, "idx1": idx1, "idx2": idx2}
+        # 1x1 proj 到 base
+        f = self.in_proj(x9.permute(0, 2, 1))  # (B,base,N)
+        f = f.permute(0, 2, 1).contiguous()    # (B,N,base)
 
-    def get_loss(self,
-                 points,          # (B,N,3)
-                 labels,          # (B,N)
-                 class_weights=None,   # (C,)
-                 ignore_index: int = -1,
-                 aux_weight: float = 0.4,
-                 label_smoothing: float = 0.05,
-                 focal_gamma: float = 1.5,  # 设 0 关闭 focal
-                 ):
-        logits, aux = self.forward(points)  # logits:(B,N,C)
-        B, N, C = logits.shape
+        # -------- 层次编码 + FPS 下采样 --------
+        # L0: N
+        f0 = self.local1(f, xyz_normed)  # (B,N,base)
 
-        # 主损失
-        loss_main = F.cross_entropy(
-            logits.reshape(-1, C),
-            labels.reshape(-1),
-            weight=class_weights,
-            ignore_index=ignore_index,
-            label_smoothing=label_smoothing,
-            reduction='none'
-        )  # (B*N,)
-        # focal（可选）
-        if focal_gamma and focal_gamma > 0:
+        # 采样到 512
+        m1 = min(512, N)
+        idx_512 = farthest_point_sample(xyz_normed, m1)  # (B,512)
+        xyz_512 = batched_index_points(xyz_normed, idx_512)  # (B,512,3)
+        f_512 = batched_index_points(f0, idx_512)            # (B,512,base)
+
+        f1 = self.local2(f_512, xyz_512)  # (B,512,2*base)
+        f1_red = self.down1(f1.permute(0, 2, 1)).permute(0, 2, 1).contiguous()  # (B,512,base)
+
+        # 采样到 128
+        m2 = min(128, m1)
+        idx_128 = farthest_point_sample(xyz_512, m2)  # (B,128)
+        xyz_128 = batched_index_points(xyz_512, idx_128)  # (B,128,3)
+        f_128 = batched_index_points(f1, idx_128)         # (B,128,2*base)
+
+        f2 = self.local3(f_128, xyz_128)  # (B,128,2*base)
+        f2_red = self.down2(f2.permute(0, 2, 1)).permute(0, 2, 1).contiguous()  # (B,128,2*base)
+
+        if self.debug:
             with torch.no_grad():
-                pt = torch.softmax(logits, dim=-1).gather(-1, labels.unsqueeze(-1)).clamp_min(1e-6).squeeze(-1)
-                mask = (labels != ignore_index)
-            loss_main = loss_main * ((1 - pt.reshape(-1)).pow(focal_gamma))
-            loss_main = loss_main[mask.reshape(-1)]
+                n_nan = torch.isnan(f1_red).any().item() or torch.isnan(f2_red).any().item()
+                n_inf = torch.isinf(f1_red).any().item() or torch.isinf(f2_red).any().item()
+                print(f"[DEBUG] out1 shape: {f1_red.shape}, NaN={int(n_nan)}, Inf={int(n_inf)}")
+                print(f"[DEBUG] out2 shape: {f2_red.shape}, NaN={int(n_nan)}, Inf={int(n_inf)}")
 
-        loss_main = loss_main.mean()
+        # -------- 上采样到 512，再到 N --------
+        up_512 = three_nn_interpolate(xyz_128, xyz_512, f2_red)   # (B,512,2*base)
+        fuse_512 = torch.cat([f1, f1_red, up_512], dim=-1)        # (B,512, 2b + b + 2b = 5b)
+        fuse_512 = self.up1(fuse_512.permute(0, 2, 1)).permute(0, 2, 1).contiguous()  # (B,512,2b)
 
-        # 辅助损失（在 m1 上对齐标签）
-        sem1_logits = aux["sem1_logits"]            # (B,m1,C)
-        idx1 = aux["idx1"]                          # (B,m1)
-        labels_m1 = torch.gather(labels, 1, idx1)   # (B,m1)
-        loss_aux = F.cross_entropy(
-            sem1_logits.reshape(-1, C),
-            labels_m1.reshape(-1),
-            weight=class_weights,
+        up_N = three_nn_interpolate(xyz_512, xyz_normed, fuse_512)  # (B,N,2b)
+        fuse_N = torch.cat([f0, f, up_N], dim=-1)                   # (B,N, b + b + 2b = 4b)
+        fuse_N = self.up2(fuse_N.permute(0, 2, 1)).permute(0, 2, 1).contiguous()  # (B,N,b)
+
+        # -------- 每点分类头 --------
+        logits = self.head(fuse_N.permute(0, 2, 1))  # (B,num_classes,N)
+        logits = logits.permute(0, 2, 1).contiguous()  # (B,N,num_classes)
+
+        if self.debug and not hasattr(self, "_printed_head"):
+            print(f"[DEBUG] sem1_logits shape: {logits.shape}, NaN={int(torch.isnan(logits).any())}, Inf={int(torch.isinf(logits).any())}")
+            self._printed_head = True
+
+        return logits  # (B, N, num_classes)
+
+    def get_loss(self, points: torch.Tensor, labels: torch.Tensor, ignore_index: int = -1):
+        """
+        points: (B, N, C)  — 期望 9 维（xyz+rgb+normal）
+        labels: (B, N)
+        返回: (loss, logits)
+        """
+        logits = self.forward(points)  # (B,N,num_classes)
+        # 交叉熵
+        if self.class_weights is not None:
+            weight = self.class_weights.to(points.device, dtype=points.dtype)
+        else:
+            weight = None
+
+        loss = F.cross_entropy(
+            logits.reshape(-1, self.num_classes),
+            labels.reshape(-1),
             ignore_index=ignore_index,
-            label_smoothing=label_smoothing
+            weight=weight
         )
-
-        loss = loss_main + aux_weight * loss_aux
-
-        # 计算训练时的粗 accuracy（不含 ignore）
-        with torch.no_grad():
-            pred = logits.argmax(dim=-1)
-            valid = (labels != ignore_index)
-            acc = (pred[valid] == labels[valid]).float().mean().item() if valid.any() else 0.0
-
-        return loss, logits, {"train_acc": acc, "loss_main": loss_main.item(), "loss_aux": loss_aux.item()}
+        return loss, logits
