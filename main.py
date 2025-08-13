@@ -4,7 +4,7 @@ import os
 import collections
 
 from models.sgdat import SGDAT
-from datasets.point_cloud_dataset import PointCloudDataset
+from datasets.point_cloud_dataset import PointCloudDataset, PointCloudTransform
 from trainer import Trainer
 from config import Config
 
@@ -84,13 +84,27 @@ def main():
     # 类别权重
     class_weights = compute_class_weights(train_dataset, num_classes).to(config.DEVICE)
 
-    # 初始化模型（保留你原有签名，新增 dropout_rate 透传）
+    # =========================
+    # 初始化模型：所有“反过拟合”参数都从 Config 读取，并显式传入 SGDAT
+    # =========================
+    dropout_p = config.DROPOUT_RATE if getattr(config, "ENABLE_DROPOUT", False) else 0.0
+    droppath_prob = config.DROPPATH_PROB if getattr(config, "ENABLE_DROPPATH", False) else 0.0
+    # 若只提供了一个 FEATURE_DROP_PROB，就对 RGB/Normal 使用同一个概率
+    feat_drop_p = config.FEATURE_DROP_PROB if getattr(config, "ENABLE_FEATURE_DROP", False) else 0.0
+    logit_temp = config.TEMP_FACTOR if getattr(config, "ENABLE_TEMP_SCALING", False) else 1.0
+    use_channel_ccc = getattr(config, "ENABLE_CHANNEL_CCC", False)
+
     model = SGDAT(
         num_classes=config.NUM_CLASSES,
         base_dim=64,
         max_points=config.MAX_POINTS if config.LIMIT_POINTS else None,
         debug=True,
-        dropout_rate=getattr(config, "DROPOUT_RATE", 0.1)
+        dropout_p=dropout_p,
+        droppath_prob=droppath_prob,
+        drop_rgb_p=feat_drop_p,
+        drop_normal_p=feat_drop_p,
+        logit_temp=logit_temp,
+        use_channel_ccc=use_channel_ccc
     )
 
     # 打印参数
@@ -99,7 +113,7 @@ def main():
     print(f"模型总参数: {total_params:,}")
     print(f"可训练参数: {trainable_params:,}")
 
-    # 初始化 Trainer（反过拟合策略交给 Trainer 控制）
+    # 初始化 Trainer（反过拟合策略：如标签平滑与 Focal 在 Trainer/损失处启用）
     trainer = Trainer(model, config, train_dataset, val_dataset, class_weights=class_weights)
     trainer.train()
 
