@@ -4,7 +4,7 @@ import os
 import collections
 
 from models.sgdat import SGDAT
-from datasets.point_cloud_dataset import PointCloudDataset, PointCloudTransform
+from datasets.point_cloud_dataset import PointCloudDataset
 from trainer import Trainer
 from config import Config
 
