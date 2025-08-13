@@ -26,7 +26,6 @@ class Trainer:
         self.val_dataset = val_dataset
         self.device = config.DEVICE
 
-        # 历史记录（新增）
         self.history = {
             "epoch": [],
             "train_loss": [],
@@ -37,7 +36,6 @@ class Trainer:
             "val_miou": []
         }
 
-        # 如果传入了 class_weights，就放到 GPU
         if class_weights is not None:
             if isinstance(class_weights, torch.Tensor):
                 self.class_weights = class_weights.detach().clone().to(self.device, dtype=torch.float32)
@@ -46,20 +44,19 @@ class Trainer:
         else:
             self.class_weights = None
 
-        # AMP scaler（在 cuda 时启用）
         self.scaler = GradScaler() if self.device.startswith('cuda') else None
 
-        # 最大点数来自 dataset（默认回退）
-        self.max_points = getattr(train_dataset, 'max_points', 20000)
-        print(f"训练器初始化：使用与数据集匹配的最大点数 {self.max_points}")
+        # 最大点数（只在 LIMIT_POINTS=True 时生效）
+        self.max_points = getattr(config, 'MAX_POINTS', 20000)
+        print(f"训练器初始化：{'限制最大点数 ' + str(self.max_points) if config.LIMIT_POINTS else '不限制点数'}")
 
-        # 自定义 collate（保证 shape 固定）
         def custom_collate(batch):
             points_list = [item[0] for item in batch]
             labels_list = [item[1] for item in batch]
+            if not config.LIMIT_POINTS:
+                return torch.stack(points_list), torch.stack(labels_list)
 
-            padded_points = []
-            padded_labels = []
+            padded_points, padded_labels = [], []
             for p, l in zip(points_list, labels_list):
                 if p.shape[0] > self.max_points:
                     p = p[:self.max_points]
@@ -72,12 +69,11 @@ class Trainer:
                 padded_labels.append(l)
             return torch.stack(padded_points), torch.stack(padded_labels)
 
-        # DataLoader
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=config.BATCH_SIZE,
             shuffle=True,
-            num_workers=getattr(config, 'NUM_WORKERS', 4),
+            num_workers=config.NUM_WORKERS,
             pin_memory=True,
             collate_fn=custom_collate,
             drop_last=True
@@ -86,13 +82,12 @@ class Trainer:
             val_dataset,
             batch_size=config.BATCH_SIZE,
             shuffle=False,
-            num_workers=getattr(config, 'NUM_WORKERS', 4),
+            num_workers=config.NUM_WORKERS,
             pin_memory=True,
             collate_fn=custom_collate,
             drop_last=False
         )
 
-        # optimizer & scheduler
         self.optimizer = optim.Adam(
             self.model.parameters(),
             lr=config.LEARNING_RATE,
@@ -103,27 +98,18 @@ class Trainer:
             T_max=config.MAX_EPOCHS,
             eta_min=1e-5
         )
-
-        # grad clipping threshold（可在 config 中覆写）
         self.clip_norm = getattr(config, 'CLIP_NORM', 2.0)
 
-        # 日志与保存目录
         os.makedirs(config.MODEL_SAVE_DIR, exist_ok=True)
         os.makedirs(config.LOG_DIR, exist_ok=True)
         self.writer = SummaryWriter(config.LOG_DIR)
-
-        # 记录最佳 val mIoU
         self.best_val_miou = 0.0
-
-        # 计算 class weights（缓解类别不平衡）
         self.class_weights = self._compute_class_weights()
         print(f"[Trainer] class_weights: {self.class_weights}")
-
-        # 在初始化完成时打印配置
         config.print_config()
 
+
     def _compute_class_weights(self):
-        """统计训练集中每类样本数并返回归一化权重张量"""
         counts = np.zeros(self.config.NUM_CLASSES, dtype=np.int64)
         for scene in self.train_dataset.scene_list:
             seg_path = os.path.join(scene, 'segment20.npy')
@@ -134,12 +120,10 @@ class Trainer:
                     binc = np.bincount(arr, minlength=self.config.NUM_CLASSES)
                     counts += binc
         print("[Trainer] class counts:", counts)
-        # avoid zero division and very large weights
         inv = 1.0 / (counts + 1e-6)
         weights = inv / inv.sum() * float(self.config.NUM_CLASSES)
         weights = np.where(np.isfinite(weights), weights, 1.0)
-        tensor_weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
-        return tensor_weights
+        return torch.tensor(weights, dtype=torch.float32).to(self.device)
 
     def train_epoch(self, epoch):
         self.model.train()
