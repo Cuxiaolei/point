@@ -10,7 +10,7 @@ class Config:
 
     # ================== 模型参数 ==================
     NUM_CLASSES = 3
-    BATCH_SIZE = 1
+    BATCH_SIZE = 5
     LEARNING_RATE = 1e-3
     WEIGHT_DECAY = 1e-5
     MAX_EPOCHS = 100
