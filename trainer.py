@@ -28,7 +28,10 @@ class Trainer:
 
         # 如果传入了 class_weights，就放到 GPU
         if class_weights is not None:
-            self.class_weights = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
+            if isinstance(class_weights, torch.Tensor):
+                self.class_weights = class_weights.detach().clone().to(self.device, dtype=torch.float32)
+            else:
+                self.class_weights = torch.as_tensor(class_weights, dtype=torch.float32, device=self.device)
         else:
             self.class_weights = None
 

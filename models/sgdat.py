@@ -305,15 +305,87 @@ class SGDAT(nn.Module):
 
         return logits  # (B, N, num_classes)
 
-    def get_loss(self, logits, labels, class_weights=None):
+    @torch.no_grad()
+    def _compute_acc(self, logits2d, labels1d, ignore_index: int = -1):
         """
-        logits: [B, N, num_classes]
-        labels: [B, N]
+        logits2d: [B*N, C]
+        labels1d: [B*N]
         """
-        loss_fn = nn.CrossEntropyLoss(weight=class_weights, ignore_index=-1)
-        loss = loss_fn(logits.view(-1, logits.shape[-1]), labels.view(-1))
-        preds = torch.argmax(logits, dim=-1)
-        acc = (preds == labels).float()
-        acc = acc[labels != -1].mean()  # 忽略 padding
-        return loss, preds, {"acc": acc.item()}
+        valid = labels1d != ignore_index
+        if not torch.any(valid):
+            return float("nan")
+        preds = logits2d.argmax(dim=-1)
+        acc = (preds[valid] == labels1d[valid]).float().mean().item()
+        return acc
+
+    def get_loss(
+            self,
+            points,  # [B, N, Cin]
+            labels,  # [B, N]
+            class_weights=None,  # Tensor or list/np.ndarray; on same device as logits
+            ignore_index: int = -1,
+            reduction: str = "mean",
+            **kwargs  # 吞掉其它 Trainer 可能会传入的参数，避免再报 unexpected keyword
+    ):
+        """
+        统一的损失接口：Trainer 可安全传入 class_weights / ignore_index / reduction 等。
+        返回: loss, logits, stats(dict)
+        """
+        # 前向得到 logits: 期望形状 [B, N, C]
+        logits = self.forward(points)  # 你的 forward 应该返回 [B, N, num_classes]
+
+        if logits.dim() != 3:
+            raise RuntimeError(f"SGDAT.forward should return [B, N, C], but got shape {tuple(logits.shape)}")
+
+        B, N, C = logits.shape
+
+        # 和 labels 对齐 & 处理可能的 [B, C, N] 情况（以防 forward 改了）
+        if labels.dim() == 1 and labels.numel() == B * N:
+            labels = labels.view(B, N)
+        elif labels.dim() != 2 or labels.shape != (B, N):
+            # 如果 logits 是 [B, C, N] 也尝试纠正
+            if logits.shape == (B, C, labels.shape[-1]):  # [B, C, N]
+                logits = logits.transpose(1, 2)  # -> [B, N, C]
+                B, N, C = logits.shape
+                if labels.dim() == 1 and labels.numel() == B * N:
+                    labels = labels.view(B, N)
+                elif labels.dim() != 2 or labels.shape != (B, N):
+                    raise RuntimeError(
+                        f"labels shape {tuple(labels.shape)} not compatible with logits {tuple(logits.shape)}")
+            else:
+                raise RuntimeError(
+                    f"labels shape {tuple(labels.shape)} not compatible with logits {tuple(logits.shape)}")
+
+        device = logits.device
+        labels = labels.to(device=device, dtype=torch.long)
+
+        # class weights 处理到正确 dtype/device
+        weight = None
+        if class_weights is not None:
+            if isinstance(class_weights, torch.Tensor):
+                weight = class_weights.to(device=device, dtype=logits.dtype)
+            else:
+                weight = torch.tensor(class_weights, device=device, dtype=logits.dtype)
+
+        # 交叉熵（忽略 padding 标签 -1）
+        loss = F.cross_entropy(
+            logits.reshape(-1, C),  # [B*N, C]
+            labels.reshape(-1),  # [B*N]
+            weight=weight,
+            ignore_index=ignore_index,
+            reduction=reduction,
+        )
+
+        # 统计信息（忽略 padding）
+        acc = self._compute_acc(logits.reshape(-1, C), labels.reshape(-1), ignore_index=ignore_index)
+
+        stats = {
+            "acc": acc,
+            "ignore_index": ignore_index,
+        }
+        if weight is not None:
+            # 仅记录，方便日志排查
+            stats["class_weights_minmax"] = (float(weight.min().item()), float(weight.max().item()))
+
+        return loss, logits, stats
 
