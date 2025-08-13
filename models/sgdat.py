@@ -20,12 +20,11 @@ def normalize_xyz(xyz, eps=1e-6):
     """
     center = xyz.mean(dim=1, keepdim=True)
     xyz_centered = xyz - center
-    # 使用每批次内最大半径作尺度；加入 eps 防 0；再用 clamp 防 NaN/Inf
-    # 半径 = 每个点的范数，取最大
+    # 半径 = 每个点的范数，取最大；加 eps 防 0；clamp 防负数导致的 nan
     radius = torch.sqrt(torch.clamp((xyz_centered ** 2).sum(dim=-1, keepdim=True), min=0.0)).max(dim=1, keepdim=True)[0]
     scale = torch.clamp(radius, min=eps)
     xyz_normed = xyz_centered / scale
-    return xyz_normed
+    return xyz_normed, center, scale
 
 
 def batched_index_points(points, idx):
@@ -42,15 +41,12 @@ def batched_index_points(points, idx):
 def squared_distance(src, dst):
     """
     src: (B, N, C), dst: (B, M, C)  ->  (B, N, M)
-    使用数值安全的计算；并下界裁剪到 0。
+    数值安全；下界裁剪到 0。
     """
-    B, N, _ = src.shape
-    _, M, _ = dst.shape
     xx = (src ** 2).sum(dim=-1, keepdim=True)              # (B, N, 1)
     yy = (dst ** 2).sum(dim=-1).unsqueeze(1)               # (B, 1, M)
     xy = torch.bmm(src, dst.transpose(1, 2))               # (B, N, M)
     dist = xx + yy - 2 * xy
-    # 极少数情况下可能出现 -1e-7 这类负值，裁剪为 0
     dist = torch.clamp(dist, min=0.0)
     return dist
 
@@ -93,9 +89,61 @@ def farthest_point_sample(xyz, npoint):
 
 
 # -------------------------
-# 组件
+# 基础积木
 # -------------------------
+class SEModule1D(nn.Module):
+    """Squeeze-Excitation（1D），轻量通道重标定"""
+    def __init__(self, channels: int, reduction: int = 8):
+        super().__init__()
+        hidden = max(4, channels // reduction)
+        self.avg = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Conv1d(channels, hidden, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden, channels, 1, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):  # x: (B,C,N)
+        w = self.avg(x)
+        w = self.fc(w)
+        return x * w
+
+
+class ResMLP1D(nn.Module):
+    """
+    稳定的残差 1x1 MLP：Conv1d -> BN -> ReLU -> Conv1d -> BN -> SE -> 残差
+    """
+    def __init__(self, cin, cout, bn_eps=1e-3, bn_momentum=0.01, use_se=True, dropout: float = 0.0):
+        super().__init__()
+        self.match = (cin == cout)
+        self.proj = nn.Identity() if self.match else nn.Conv1d(cin, cout, 1, bias=False)
+
+        self.block = nn.Sequential(
+            nn.Conv1d(cout if self.match else cin, cout, 1, bias=False),
+            nn.BatchNorm1d(cout, eps=bn_eps, momentum=bn_momentum),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(cout, cout, 1, bias=False),
+            nn.BatchNorm1d(cout, eps=bn_eps, momentum=bn_momentum),
+        )
+        self.se = SEModule1D(cout) if use_se else nn.Identity()
+        self.act = nn.ReLU(inplace=True)
+        self.drop = nn.Dropout(p=dropout) if dropout and dropout > 0 else nn.Identity()
+
+    def forward(self, x):  # (B,N,C)
+        x = x.permute(0, 2, 1).contiguous()  # -> (B,C,N)
+        res = self.proj(x)                   # (B,cout,N)
+        out = self.block(x if self.match else self.proj(x))
+        out = self.se(out)
+        out = res + out
+        out = self.act(out)
+        out = self.drop(out)
+        out = out.permute(0, 2, 1).contiguous()  # -> (B,N,C)
+        return out
+
+
 class SharedMLP1D(nn.Module):
+    """保留一个轻量版本（用于位置/几何小分支）"""
     def __init__(self, cin, cout, bn=True, act=True, dropout: float = 0.0,
                  bn_eps: float = 1e-3, bn_momentum: float = 0.01):
         super().__init__()
@@ -109,8 +157,7 @@ class SharedMLP1D(nn.Module):
             layers.append(nn.Dropout(p=dropout))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x):
-        # 输入 (B,N,C) -> Conv1d 需要 (B,C,N)
+    def forward(self, x):  # (B,N,C)
         x = x.permute(0, 2, 1).contiguous()
         x = self.net(x)
         x = x.permute(0, 2, 1).contiguous()
@@ -144,6 +191,8 @@ class SGDAT(nn.Module):
         # ====== BN 稳定性参数 ======
         bn_eps: float = 1e-3,
         bn_momentum: float = 0.01,
+        # ====== 轻几何增强 ======
+        use_geom_enhance: bool = True,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -168,17 +217,31 @@ class SGDAT(nn.Module):
         self.bn_eps = float(bn_eps)
         self.bn_momentum = float(bn_momentum)
 
-        # Encoder level-0 (N points): 输入 9 维
-        self.enc0 = SharedMLP1D(9, base_dim, dropout=self.dropout_p,
-                                bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)  # (B,N,64)
+        self.use_geom_enhance = bool(use_geom_enhance)
 
-        # 512 层编码： [xyz(3)+feat64] -> 64
-        self.enc512 = SharedMLP1D(3 + base_dim, base_dim, dropout=self.dropout_p,
-                                  bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)  # (B,512,64)
+        # ---------- Encoder ----------
+        # enc0：输入 9 维 -> 64（残差块）
+        self.enc0 = ResMLP1D(9, base_dim, bn_eps=self.bn_eps, bn_momentum=self.bn_momentum,
+                             use_se=True, dropout=self.dropout_p)  # (B,N,64)
 
-        # 128 层编码： [xyz(3)+feat64] -> 128
-        self.enc128 = SharedMLP1D(3 + base_dim, base_dim * 2, dropout=self.dropout_p,
-                                  bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)  # (B,128,128)
+        # 轻几何增强：r(范数)、h(归一化后 z) -> 小支路
+        if self.use_geom_enhance:
+            self.geom_embed_512 = SharedMLP1D(2, base_dim // 2, dropout=self.dropout_p,
+                                              bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)  # (B,512,base_dim//2)
+            self.geom_embed_N   = SharedMLP1D(2, base_dim // 2, dropout=self.dropout_p,
+                                              bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)  # (B,N,base_dim//2)
+        else:
+            self.geom_embed_512 = None
+            self.geom_embed_N = None
+
+        # 512 层编码： [xyz(3)+feat64(+geom?)] -> 64（残差块）
+        self.enc512_in_dim = 3 + base_dim + (base_dim // 2 if self.use_geom_enhance else 0)
+        self.enc512 = ResMLP1D(self.enc512_in_dim, base_dim, bn_eps=self.bn_eps,
+                               bn_momentum=self.bn_momentum, use_se=True, dropout=self.dropout_p)
+
+        # 128 层编码： [xyz(3)+feat64] -> 128（残差块）
+        self.enc128 = ResMLP1D(3 + base_dim, base_dim * 2, bn_eps=self.bn_eps,
+                               bn_momentum=self.bn_momentum, use_se=True, dropout=self.dropout_p)
 
         # 可选通道注意力
         if self.use_channel_ccc:
@@ -190,13 +253,11 @@ class SGDAT(nn.Module):
 
         # 动态邻域 - 通道融合（在 512 / 128 尺度）
         if self.use_dynamic_fusion:
-            # 512: 从原始 N 集合上以 idx_512 为中心，融合 enc0(N,64) -> (B,512,64)
             self.dyn512 = DynamicRadiusChannelFusion(
                 in_channels=base_dim, out_channels=base_dim,
                 num_neighbors=self.dyn_neighbors,
                 min_radius=self.dyn_min_radius, max_radius=self.dyn_max_radius
             )
-            # 128: 在 512 子集上以 idx_128 为中心，融合 feat_512(512,64) -> (B,128,128)
             self.dyn128 = DynamicRadiusChannelFusion(
                 in_channels=base_dim, out_channels=base_dim * 2,
                 num_neighbors=self.dyn_neighbors,
@@ -206,7 +267,7 @@ class SGDAT(nn.Module):
             self.dyn512 = None
             self.dyn128 = None
 
-        # 位置编码
+        # 位置/尺度编码
         self.pos512 = SharedMLP1D(3, base_dim * 2, dropout=self.dropout_p,
                                   bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)   # 3 -> 128
         self.posN   = SharedMLP1D(3, base_dim,     dropout=self.dropout_p,
@@ -214,25 +275,33 @@ class SGDAT(nn.Module):
 
         # 线性 GVA（在融合后的 512、N 尺度）
         if self.use_linear_gva:
-            self.gva_512 = LinearSpatialGVA(dim=base_dim * 2)  # 作用在 fuse_512(128) 的通道数上
+            self.gva_512 = LinearSpatialGVA(dim=base_dim * 2)  # 作用在 fuse_512(128)
             self.gva_N   = LinearSpatialGVA(dim=base_dim * 2)  # 作用在 fuse_N(128)
         else:
             self.gva_512 = nn.Identity()
             self.gva_N   = nn.Identity()
 
-        # Decoder 融合
+        # ---------- Decoder ----------
+        # 512 融合： [feat_512(64) + up128(128) + pos512(128)] -> 128
         self.up1 = nn.Sequential(
-            nn.Conv1d(base_dim + base_dim * 2 + base_dim * 2, base_dim * 2, 1),  # 64 + 128 + 128 -> 128
+            nn.Conv1d(base_dim + base_dim * 2 + base_dim * 2, base_dim * 2, 1, bias=False),  # 64 + 128 + 128 -> 128
             nn.BatchNorm1d(base_dim * 2, eps=self.bn_eps, momentum=self.bn_momentum),
             nn.ReLU(inplace=True),
             nn.Dropout(p=self.dropout_p) if self.dropout_p > 0 else nn.Identity()
         )
+        # 融合后再加一个残差细化
+        self.up1_refine = ResMLP1D(base_dim * 2, base_dim * 2, bn_eps=self.bn_eps,
+                                   bn_momentum=self.bn_momentum, use_se=True, dropout=self.dropout_p)
+
+        # N 融合： [up512_to_N(128) + feat0(64) + posN(64)] -> 128
         self.up2 = nn.Sequential(
-            nn.Conv1d(base_dim * 2 + base_dim + base_dim, base_dim * 2, 1),      # 128 + 64 + 64 -> 128
+            nn.Conv1d(base_dim * 2 + base_dim + base_dim, base_dim * 2, 1, bias=False),      # 128 + 64 + 64 -> 128
             nn.BatchNorm1d(base_dim * 2, eps=self.bn_eps, momentum=self.bn_momentum),
             nn.ReLU(inplace=True),
             nn.Dropout(p=self.dropout_p) if self.dropout_p > 0 else nn.Identity()
         )
+        self.up2_refine = ResMLP1D(base_dim * 2, base_dim * 2, bn_eps=self.bn_eps,
+                                   bn_momentum=self.bn_momentum, use_se=True, dropout=self.dropout_p)
 
         # DropPath
         self.branch_dp1 = DropPath(self.droppath_prob) if self.droppath_prob > 0 else nn.Identity()
@@ -289,6 +358,15 @@ class SGDAT(nn.Module):
             out[:, :, 6:9] = 0.0
         return out
 
+    def _geom_tokens(self, xyz_normed):
+        """
+        生成轻量几何标量：r（范数），h（z 轴高度）
+        xyz_normed: (B,N,3)  返回 (B,N,2)
+        """
+        r = torch.sqrt(torch.clamp((xyz_normed ** 2).sum(dim=-1, keepdim=True), min=0.0))
+        h = xyz_normed[..., 2:3]
+        return torch.cat([r, h], dim=-1)
+
     # ---------- 前向 ----------
     def forward(self, points):
         """
@@ -304,19 +382,33 @@ class SGDAT(nn.Module):
         # 分组丢弃
         points = self._feature_group_dropout(points)
 
-        # 拆分
+        # 拆分 + 归一化
         xyz = points[:, :, 0:3]
-        xyz_normed = normalize_xyz(xyz)
+        xyz_normed, center, scale = normalize_xyz(xyz)
 
-        # 编码 0：输入到 64
+        # 编码 0：输入到 64（残差）
         feat0 = self.enc0(points)  # (B,N,64)
+
+        # 轻几何增强 tokens
+        if self.use_geom_enhance:
+            geom_N = self._geom_tokens(xyz_normed)          # (B,N,2)
+            geom_emb_N = self.geom_embed_N(geom_N)          # (B,N,base_dim//2)
+        else:
+            geom_emb_N = None
 
         # 下采样到 512
         xyz_512, feat0_512, idx_512 = self._sample_and_gather(xyz_normed, feat0, npoint=512)  # (B,512,3),(B,512,64)
-        enc_512_in = torch.cat([xyz_512, feat0_512], dim=-1)  # (B,512,67)
-        feat_512 = self.enc512(enc_512_in)                    # (B,512,64)
 
-        # —— 动态邻域-通道融合 @512：在 N 上用 idx_512 聚合 enc0(N,64) 到 512
+        # 编码 512 输入：xyz + feat0_512 +（可选 geom_512_emb）
+        if self.use_geom_enhance:
+            geom_512 = batched_index_points(geom_N, idx_512)               # (B,512,2)
+            geom_emb_512 = self.geom_embed_512(geom_512)                   # (B,512,base_dim//2)
+            enc_512_in = torch.cat([xyz_512, feat0_512, geom_emb_512], dim=-1)
+        else:
+            enc_512_in = torch.cat([xyz_512, feat0_512], dim=-1)
+        feat_512 = self.enc512(enc_512_in)                                 # (B,512,64)
+
+        # —— 动态邻域-通道融合 @512
         if self.use_dynamic_fusion and self.dyn512 is not None:
             dyn_512, _ = self.dyn512(points=xyz_normed, feats=feat0, center_idx=idx_512)  # (B,512,64)
             feat_512 = feat_512 + dyn_512  # 残差融合
@@ -329,7 +421,7 @@ class SGDAT(nn.Module):
         enc_128_in = torch.cat([xyz_128, feat_512_128], dim=-1)  # (B,128,67)
         feat_128 = self.enc128(enc_128_in)                       # (B,128,128)
 
-        # —— 动态邻域-通道融合 @128：在 512 子集上用 idx_128 聚合 feat_512(512,64) -> (B,128,128)
+        # —— 动态邻域-通道融合 @128
         if self.use_dynamic_fusion and self.dyn128 is not None:
             dyn_128, _ = self.dyn128(points=xyz_512, feats=feat_512, center_idx=idx_128)  # (B,128,128)
             feat_128 = feat_128 + dyn_128  # 残差融合
@@ -344,7 +436,7 @@ class SGDAT(nn.Module):
                 print(f"[DEBUG] out1 shape: {feat_512.shape}, NaN={int(n_nan1)}, Inf={int(torch.isinf(feat_512).any().item())}")
                 print(f"[DEBUG] out2 shape: {feat_128.shape}, NaN={int(n_nan2)}, Inf={int(torch.isinf(feat_128).any().item())}")
 
-        # Decoder: 128 -> 512
+        # ---------- Decoder: 128 -> 512 ----------
         up128_to_512 = nearest_interpolate(xyz_512, xyz_128, feat_128)  # (B,512,128)
         pos512 = self.pos512(xyz_512)                                   # (B,512,128)
 
@@ -352,21 +444,27 @@ class SGDAT(nn.Module):
         up128_to_512 = self.branch_dp1(up128_to_512)
         pos512 = self.branch_dp1(pos512)
 
-        # 融合并（可选）加一层线性 GVA 做空间聚合
+        # 融合 + 细化 + 轻量空间注意
         fuse_512 = torch.cat([feat_512, up128_to_512, pos512], dim=-1)  # (B,512,320)
         fuse_512 = self.up1(fuse_512.permute(0, 2, 1)).permute(0, 2, 1).contiguous()  # (B,512,128)
-        fuse_512 = self.gva_512(fuse_512)  # 轻量空间注意
+        fuse_512 = self.up1_refine(fuse_512)  # 残差细化
+        fuse_512 = self.gva_512(fuse_512)     # 轻量空间注意
 
-        # Decoder: 512 -> N
+        # ---------- Decoder: 512 -> N ----------
         up512_to_N = nearest_interpolate(xyz_normed, xyz_512, fuse_512)  # (B,N,128)
         posN = self.posN(xyz_normed)                                     # (B,N,64)
+
+        # 若有 N 级几何嵌入，可与 posN 融合（直接相加，通道数不同则忽略）
+        if self.use_geom_enhance and geom_emb_N is not None and geom_emb_N.shape[-1] == posN.shape[-1]:
+            posN = posN + geom_emb_N
 
         up512_to_N = self.branch_dp2(up512_to_N)
         posN = self.branch_dp2(posN)
 
         fuse_N = torch.cat([up512_to_N, feat0, posN], dim=-1)            # (B,N,256)
         fuse_N = self.up2(fuse_N.permute(0, 2, 1)).permute(0, 2, 1).contiguous()  # (B,N,128)
-        fuse_N = self.gva_N(fuse_N)  # 轻量空间注意
+        fuse_N = self.up2_refine(fuse_N)  # 残差细化
+        fuse_N = self.gva_N(fuse_N)       # 轻量空间注意
 
         logits = self.head(fuse_N.permute(0, 2, 1)).permute(0, 2, 1).contiguous()  # (B,N,K)
 

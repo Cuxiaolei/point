@@ -1,339 +1,411 @@
+# modules_sgdat.py
+# -*- coding: utf-8 -*-
+import math
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn import Dropout
-import random
-from config import Config
-
-# =========================
-# Common helpers (stable)
-# =========================
-_STABLE_EPS = 1e-6
-_LN_EPS = 1e-5
 
 
-def init_weights_stable(m: nn.Module):
-    """Stable default init: Linear -> Xavier; LayerNorm -> (1,0)."""
+# ------------------------------------------------------------
+# 初始化工具
+# ------------------------------------------------------------
+def init_linear(m: nn.Module):
     if isinstance(m, nn.Linear):
-        nn.init.xavier_uniform_(m.weight)
+        nn.init.xavier_normal_(m.weight)
         if m.bias is not None:
             nn.init.zeros_(m.bias)
-    elif isinstance(m, nn.LayerNorm):
-        if m.elementwise_affine:
-            nn.init.ones_(m.weight)
+
+
+def init_conv1x1(m: nn.Module):
+    if isinstance(m, nn.Conv1d):
+        nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+        if m.bias is not None:
             nn.init.zeros_(m.bias)
 
 
-def pairwise_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+# ------------------------------------------------------------
+# 基础模块
+# ------------------------------------------------------------
+class MLP1d(nn.Module):
     """
-    Compute squared pairwise euclidean distances in a numerically stable way.
-      a: (B, M, 3), b: (B, N, 3) -> (B, M, N)
+    1x1 Conv -> BN -> ReLU 的堆叠。输入/输出: [B, C_in, N] -> [B, C_out, N]
     """
-    # Convert to float32 for stability if in mixed precision
-    dtype = torch.float32 if a.dtype in (torch.float16, torch.bfloat16) else a.dtype
-    a_ = a.to(dtype)
-    b_ = b.to(dtype)
-    a_sq = (a_ ** 2).sum(dim=-1, keepdim=True)              # (B, M, 1)
-    b_sq = (b_ ** 2).sum(dim=-1, keepdim=True).transpose(1, 2)  # (B, 1, N)
-    inner = torch.bmm(a_, b_.transpose(1, 2))               # (B, M, N)
-    dist2 = a_sq + b_sq - 2 * inner
-    dist2 = torch.clamp(dist2, min=0.0)                     # avoid tiny negatives
-    dist2 = torch.nan_to_num(dist2)
-    return dist2
+    def __init__(self, c_in: int, c_out: int, use_bn: bool = True, dropout: float = 0.0):
+        super().__init__()
+        self.conv = nn.Conv1d(c_in, c_out, kernel_size=1, bias=not use_bn)
+        self.bn = nn.BatchNorm1d(c_out) if use_bn else nn.Identity()
+        self.act = nn.ReLU(inplace=True)
+        self.drop = nn.Dropout(p=dropout) if dropout > 1e-6 else nn.Identity()
+        self.apply(init_conv1x1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C_in, N]
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.act(x)
+        x = self.drop(x)
+        return x
 
 
-def farthest_point_sample(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
-    """Simple (but vectorized-ish) FPS. xyz: (B,N,3) -> idx: (B,npoint)"""
-    device = xyz.device
-    B, N, _ = xyz.shape
-    if npoint >= N:
-        idx = torch.arange(N, device=device).unsqueeze(0).repeat(B, 1)
-        return idx[:, :npoint]
-    centroids = torch.zeros(B, npoint, dtype=torch.long, device=device)
-    distance = torch.full((B, N), 1e10, device=device)
-    farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
-    batch_indices = torch.arange(B, dtype=torch.long, device=device)
-    for i in range(npoint):
-        centroids[:, i] = farthest
-        centroid_xyz = xyz[batch_indices, farthest, :].view(B, 1, 3)
-        dist = ((xyz - centroid_xyz) ** 2).sum(-1)
-        mask = dist < distance
-        distance[mask] = dist[mask]
-        farthest = torch.max(distance, dim=1)[1]
-    return centroids
+class SE1d(nn.Module):
+    """
+    Squeeze-Excitation for 1D features. 输入 [B, C, N]
+    """
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        hidden = max(8, channels // reduction)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc1 = nn.Linear(channels, hidden, bias=True)
+        self.fc2 = nn.Linear(hidden, channels, bias=True)
+        self.act = nn.ReLU(inplace=True)
+        self.gate = nn.Sigmoid()
+        self.apply(init_linear)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, n = x.shape
+        y = self.pool(x).view(b, c)               # [B, C]
+        y = self.fc2(self.act(self.fc1(y)))       # [B, C]
+        y = self.gate(y).view(b, c, 1)            # [B, C, 1]
+        return x * y
 
 
-def safe_knn_idx(dist: torch.Tensor,
-                 radius,
-                 num_neighbors: int,
-                 num_points: int) -> torch.Tensor:
+class Residual(nn.Module):
     """
-    dist: (B, M, N) pairwise distances (non-negative)
-    Return (B, M, K) indices within radius, with safe fallbacks.
+    残差封装：y = x + F(x)（若维度不匹配则使用1x1投影）
     """
-    device = dist.device
-    if not torch.is_tensor(radius):
-        radius = torch.tensor(radius, device=device, dtype=dist.dtype)
-    # allow broadcasting if radius is scalar
-    mask = dist <= radius.unsqueeze(-1)
-    # mask invalid distances to large number, then topk
-    masked = torch.where(mask, dist, torch.full_like(dist, 1e9))
-    masked = masked.clamp(min=0.0)
-    K = min(num_neighbors, num_points)
-    # If all are 1e9 (no neighbor), topk will still return some indices, that's OK
-    _, idx = torch.topk(masked, k=K, dim=-1, largest=False)  # (B,M,K)
-    idx = idx.clamp(0, num_points - 1)
+    def __init__(self, c_in: int, c_out: int):
+        super().__init__()
+        self.need_proj = (c_in != c_out)
+        self.proj = nn.Conv1d(c_in, c_out, kernel_size=1, bias=False) if self.need_proj else nn.Identity()
+        if self.need_proj:
+            nn.init.kaiming_normal_(self.proj.weight, mode="fan_out", nonlinearity="relu")
+
+    def forward(self, x: torch.Tensor, fx: torch.Tensor) -> torch.Tensor:
+        if self.need_proj:
+            x = self.proj(x)
+        return x + fx
+
+
+# ------------------------------------------------------------
+# 邻域检索与采样
+# ------------------------------------------------------------
+def knn_indices(coords: torch.Tensor, k: int) -> torch.Tensor:
+    """
+    简单 KNN（基于欧氏距离的全连接计算）:
+    coords: [B, 3, N]
+    return: idx [B, N, k]
+    """
+    b, _, n = coords.shape
+    # [B, N, N]
+    with torch.no_grad():
+        dist2 = torch.cdist(coords.transpose(1, 2).contiguous(), coords.transpose(1, 2).contiguous(), p=2)
+        # 取最近邻（包含自身）
+        idx = dist2.topk(k=k, largest=False)[1]   # [B, N, k]
     return idx
 
 
-# -----------------------------
-# Stochastic Depth / DropPath
-# -----------------------------
-def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False):
-    if drop_prob == 0.0 or not training:
-        return x
-    keep_prob = 1.0 - drop_prob
-    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-    random_tensor.floor_()
-    return x.div(keep_prob) * random_tensor
-
-
-class DropPath(nn.Module):
-    def __init__(self, drop_prob: float = 0.0):
-        super().__init__()
-        self.drop_prob = float(drop_prob)
-
-    def forward(self, x: torch.Tensor):
-        return drop_path(x, self.drop_prob, self.training)
-
-
-# -----------------------------
-# Feature Dropout
-# -----------------------------
-def feature_dropout(x: torch.Tensor, drop_prob: float = 0.1):
+def gather_neighbor(feat: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     """
-    Per-element feature dropout with runtime gating. Returns masked x.
+    feat: [B, C, N]
+    idx:  [B, N, k]
+    return: [B, C, N, k]
     """
-    if drop_prob <= 0.0:
-        return x
-    # Make the mask deterministic w.r.t. autograd graph size
-    mask = (torch.rand_like(x) > drop_prob).to(x.dtype)
-    return x * mask
+    b, c, n = feat.shape
+    k = idx.shape[-1]
+    idx_expand = idx.unsqueeze(1).expand(b, c, n, k)  # [B, C, N, K]
+    feat_expand = feat.unsqueeze(2).expand(b, c, n, n)
+    # 使用 take_along_dim 选取邻域特征
+    neigh = torch.take_along_dim(feat_expand, idx_expand, dim=3)  # [B, C, N, K]
+    return neigh
 
 
-# -----------------------------
-# Residual Scale (learnable)
-# -----------------------------
-class ResidualScale(nn.Module):
+def hybrid_fps_random(xyz: torch.Tensor, m: int, fps_ratio: float = 0.7) -> torch.Tensor:
     """
-    Learnable scalar (single parameter) to scale residual branch.
-    Initialized to init_value (e.g., 0.5) to improve early-stage stability.
+    混合采样：FPS + 随机
+    xyz: [B, 3, N]
+    return: idx [B, m]
     """
-    def __init__(self, init_value: float = 0.5):
-        super().__init__()
-        self.scale = nn.Parameter(torch.tensor(float(init_value)))
+    b, _, n = xyz.shape
+    device = xyz.device
+    m = min(m, n)
+    fps_m = int(m * fps_ratio)
+    rand_m = m - fps_m
 
-    def forward(self, x: torch.Tensor):
-        return x * self.scale
+    # --- FPS 简化实现（朴素 O(B*N*m)），在 N 较大时可用更高效实现 ---
+    with torch.no_grad():
+        idxs = []
+        for bi in range(b):
+            pts = xyz[bi].transpose(0, 1).contiguous()  # [N, 3]
+            # 随机初始化一个中心
+            farthest = torch.randint(0, n, (1,), device=device)
+            centroids = [farthest.item()]
+            dist = torch.full((n,), 1e10, device=device)
+            for _ in range(max(1, fps_m) - 1):
+                centroid = pts[centroids[-1]].unsqueeze(0)  # [1, 3]
+                d = torch.sum((pts - centroid) ** 2, dim=1)
+                dist = torch.minimum(dist, d)
+                farthest = torch.argmax(dist)
+                centroids.append(int(farthest))
+            centroids = torch.tensor(centroids, device=device, dtype=torch.long)
+            if rand_m > 0:
+                rand_idx = torch.randperm(n, device=device)[:rand_m]
+                out = torch.cat([centroids, rand_idx], dim=0)
+            else:
+                out = centroids
+            # 去重 & 截断
+            out = torch.unique_consecutive(out)[:m]
+            if out.numel() < m:
+                # 不足则补随机
+                need = m - out.numel()
+                extra = torch.randperm(n, device=device)[:need]
+                out = torch.cat([out, extra], dim=0)
+            idxs.append(out.unsqueeze(0))
+        idx = torch.cat(idxs, dim=0)  # [B, m]
+    return idx
 
 
-# ======================================
-# Core modules (stabilized implementations)
-# ======================================
+# ------------------------------------------------------------
+# 动态半径通道融合（改进版）
+# ------------------------------------------------------------
 class DynamicRadiusChannelFusion(nn.Module):
     """
-    Dynamic radius neighborhood + channel fusion (stabilized).
-    Expects:
-      points: (B,N,3)
-      feats:  (B,N,C)
-      center_idx: (B,M) long
-    Returns:
-      out: (B,M,out_ch)
-      knn_idx: (B,M,K)
+    输入:
+        x:     [B, C, N]   特征
+        pos:   [B, 3, N]   坐标
+    过程:
+        - KNN 邻域
+        - 距离 → 权重 softmax(-d/τ)
+        - 距离加权聚合（减少过度平滑）
+        - 通道 MLP + BN + ReLU + SE + 残差
+    输出:
+        y:     [B, C_out, N]
     """
-    def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 num_neighbors: int = 16,
-                 min_radius: float = 0.02,
-                 max_radius: float = 0.3):
+    def __init__(
+        self,
+        c_in: int,
+        c_hidden: Optional[int] = None,
+        c_out: Optional[int] = None,
+        k: int = 16,
+        tau: float = 0.2,
+        reduction: int = 16,
+        dropout: float = 0.0,
+    ):
         super().__init__()
-        self.num_neighbors = num_neighbors
-        self.min_radius = float(min_radius)
-        self.max_radius = float(max_radius)
-        self.in_ch = int(in_channels)
-        self.out_ch = int(out_channels)
+        c_hidden = c_hidden or c_in
+        c_out = c_out or c_in
+        self.k = k
+        self.tau = tau
 
-        # pre/post norms for stability
-        self.pre_norm = nn.LayerNorm(in_channels * 2, eps=_LN_EPS)
-        self.post_norm = nn.LayerNorm(out_channels, eps=_LN_EPS)
-
-        # channel attention (sigmoid gating)
+        # 邻域增强后的通道融合
         self.channel_proj = nn.Sequential(
-            nn.Linear(in_channels * 2, in_channels),
-            nn.ReLU(inplace=True),
-            nn.Linear(in_channels, in_channels),
-            nn.Sigmoid()
+            MLP1d(c_in * 2, c_hidden, use_bn=True, dropout=dropout),
+            MLP1d(c_hidden, c_out, use_bn=True, dropout=dropout),
         )
+        self.se = SE1d(c_out, reduction=reduction)
+        self.res = Residual(c_in, c_out)
 
-        # local fusion + projection
-        self.mlp = nn.Sequential(
-            nn.Linear(in_channels, out_channels),
-            nn.ReLU(inplace=True),
-            nn.Dropout(Config.DROPOUT_RATE) if Config.ENABLE_DROPOUT else nn.Identity()
-        )
+    def forward(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        # 保护数值
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+        pos = torch.nan_to_num(pos, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        # residual scaling to tame magnitude growth
-        self.res_scale = ResidualScale(init_value=0.5)
+        b, c, n = x.shape
+        # KNN
+        idx = knn_indices(pos, k=self.k)  # [B, N, k]
+        # 邻域特征
+        neigh_x = gather_neighbor(x, idx)  # [B, C, N, k]
+        # 邻域坐标用于计算距离
+        pos_expand = pos.unsqueeze(-1).expand(b, 3, n, self.k)             # [B, 3, N, k]
+        neigh_pos = gather_neighbor(pos, idx)                               # [B, 3, N, k]
+        d = torch.norm(neigh_pos - pos_expand, dim=1)                       # [B, N, k]
+        d = torch.clamp(d, min=1e-6)
+        # 权重：softmax(-d/τ)
+        w = F.softmax(-d / max(1e-6, self.tau), dim=-1).unsqueeze(1)        # [B, 1, N, k]
+        # 加权聚合
+        agg = torch.sum(neigh_x * w, dim=-1)                                # [B, C, N]
 
-        self.drop_path = DropPath(Config.DROPPATH_PROB) if Config.ENABLE_DROPPATH else nn.Identity()
-
-        # init
-        self.apply(init_weights_stable)
-
-    def forward(self,
-                points: torch.Tensor,
-                feats: torch.Tensor,
-                center_idx: torch.Tensor):
-        """
-        points: (B,N,3), feats: (B,N,C), center_idx: (B,M)
-        """
-        B, N, _ = points.shape
-        M = center_idx.shape[1]
-
-        centers = torch.gather(points, 1, center_idx.unsqueeze(-1).expand(-1, -1, 3))  # (B,M,3)
-        dist2 = pairwise_distance(centers, points)                                     # (B,M,N)
-        dist = torch.sqrt(dist2 + _STABLE_EPS)                                         # (B,M,N)
-
-        # dynamic KNN within max_radius (min_radius currently unused but kept for future)
-        knn_idx = safe_knn_idx(dist, self.max_radius, self.num_neighbors, N)           # (B,M,K)
-        K = knn_idx.size(-1)
-
-        # gather neighbor feats
-        batch_inds = torch.arange(B, device=points.device).view(B, 1, 1).expand(-1, M, K)
-        neigh_feats = feats[batch_inds, knn_idx]                                       # (B,M,K,C)
-        neigh_feats = torch.nan_to_num(neigh_feats)
-
-        # center feats
-        centers_feats = torch.gather(feats, 1, center_idx.unsqueeze(-1).expand(-1, -1, self.in_ch))  # (B,M,C)
-        centers_feats = torch.nan_to_num(centers_feats)
-
-        # channel fusion weights from [center || neighbor]
-        centers_feats_exp = centers_feats.unsqueeze(2).expand(-1, -1, K, -1)          # (B,M,K,C)
-        combo = torch.cat([centers_feats_exp, neigh_feats], dim=-1)                    # (B,M,K,2C)
-        combo_flat = combo.reshape(-1, combo.size(-1))                                 # (B*M*K,2C)
-        combo_norm = self.pre_norm(combo_flat)
-        channel_w = self.channel_proj(combo_norm).view(B, M, K, self.in_ch)            # (B,M,K,C)
-
-        # fuse neighbors (mean with channel gating), residual to center
-        weighted = (neigh_feats * channel_w).mean(dim=2)                               # (B,M,C)
-        weighted = torch.nan_to_num(weighted)
-        fused = centers_feats + self.res_scale(weighted)                               # (B,M,C)
-
-        if Config.ENABLE_FEATURE_DROP:
-            fused = feature_dropout(fused, Config.FEATURE_DROP_PROB)
-
-        out = self.mlp(fused)                                                          # (B,M,out_ch)
-        out = torch.nan_to_num(out)
-        out = self.post_norm(out)
-        out = self.drop_path(out)
-        return out, knn_idx
-
-
-class ChannelCCC(nn.Module):
-    """
-    Channel-wise compact context (CCC) with residual & normalization.
-    """
-    def __init__(self, dim: int, hidden: int | None = None):
-        super().__init__()
-        hidden = hidden or max(dim // 4, 8)
-        self.linear1 = nn.Linear(dim, hidden)
-        self.linear2 = nn.Linear(hidden, dim)
-        self.norm = nn.LayerNorm(dim, eps=_LN_EPS)
-        self.dropout = Dropout(Config.DROPOUT_RATE) if Config.ENABLE_DROPOUT else nn.Identity()
-        self.drop_path = DropPath(Config.DROPPATH_PROB) if Config.ENABLE_DROPPATH else nn.Identity()
-        self.res_scale = ResidualScale(init_value=0.5)
-
-        self.apply(init_weights_stable)
-
-    def forward(self, x: torch.Tensor):
-        """
-        x: (B, N, C)
-        """
-        # global channel descriptor (avg over N)
-        ch_desc = x.mean(dim=1)                            # (B, C)
-        h = F.relu(self.linear1(ch_desc), inplace=True)    # (B, hidden)
-        att = torch.sigmoid(self.linear2(h)).unsqueeze(1)  # (B,1,C)
-        att = torch.nan_to_num(att)
-
-        y = x * att                                        # (B,N,C)
-        y = self.res_scale(y) + x                          # residual with scale
-        y = self.norm(y)
-
-        if Config.ENABLE_FEATURE_DROP:
-            y = feature_dropout(y, Config.FEATURE_DROP_PROB)
-        y = self.dropout(y)
-        y = self.drop_path(y)
+        # 拼接 (x || agg) 进行通道融合
+        fuse = torch.cat([x, agg], dim=1)                                   # [B, 2C, N]
+        y = self.channel_proj(fuse)                                         # [B, C_out, N]
+        y = self.se(y)
+        y = self.res(x, y)                                                  # 残差
         return y
+
+
+# ------------------------------------------------------------
+# 轻量多头注意力（全局）
+# ------------------------------------------------------------
+class MultiHeadSelfAttention1D(nn.Module):
+    """
+    多头自注意力（简化版），输入为 [B, C, N]，输出同形状。
+    默认使用缩放点积注意力；为了鲁棒性，对 logits/attn 做了 clamp。
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 4,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ):
+        super().__init__()
+        assert dim % num_heads == 0, "dim 必须能被 num_heads 整除"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop) if attn_drop > 1e-6 else nn.Identity()
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop) if proj_drop > 1e-6 else nn.Identity()
+
+        self.apply(init_linear)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, N] -> 转为 [B, N, C]
+        x_ = x.transpose(1, 2).contiguous()         # [B, N, C]
+        b, n, c = x_.shape
+
+        qkv = self.qkv(x_)                          # [B, N, 3C]
+        q, k, v = qkv.chunk(3, dim=-1)              # [B, N, C] * 3
+
+        # 分头
+        q = q.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, N, Dh]
+        k = k.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, N, Dh]
+        v = v.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, N, Dh]
+
+        # 缩放点积注意力
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale   # [B, H, N, N]
+        attn_logits = torch.nan_to_num(attn_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+        attn = F.softmax(attn_logits, dim=-1)
+        attn = self.attn_drop(attn)
+
+        out = torch.matmul(attn, v)                                       # [B, H, N, Dh]
+        out = out.transpose(1, 2).contiguous().view(b, n, c)              # [B, N, C]
+        out = self.proj(out)
+        out = self.proj_drop(out)
+
+        # 回到 [B, C, N]
+        out = out.transpose(1, 2).contiguous()
+        return out
 
 
 class LinearSpatialGVA(nn.Module):
     """
-    Linearized spatial aggregation with normalization to prevent explosion.
-    Q, K, V are linear projections; aggregation uses KV cache and a safe denom.
+    兼容原名的全局注意力模块（实现为多头注意力 + 前馈 MLP + 残差）
+    输入/输出: [B, C, N]
     """
-    def __init__(self, dim: int, kv_dim: int | None = None):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 4,
+        mlp_ratio: float = 2.0,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        dropout: float = 0.0,
+    ):
         super().__init__()
-        kv_dim = kv_dim or dim
-        self.q = nn.Linear(dim, kv_dim)
-        self.k = nn.Linear(dim, kv_dim)
-        self.v = nn.Linear(dim, dim)
+        hidden = int(dim * mlp_ratio)
 
-        self.dropout = Dropout(Config.DROPOUT_RATE) if Config.ENABLE_DROPOUT else nn.Identity()
-        self.drop_path = DropPath(Config.DROPPATH_PROB) if Config.ENABLE_DROPPATH else nn.Identity()
-        self.post_norm = nn.LayerNorm(dim, eps=_LN_EPS)
-        self.res_scale = ResidualScale(init_value=0.5)
+        self.attn = MultiHeadSelfAttention1D(
+            dim=dim,
+            num_heads=num_heads,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+        )
+        self.attn_res = Residual(dim, dim)
 
-        self.apply(init_weights_stable)
+        self.ffn = nn.Sequential(
+            MLP1d(dim, hidden, use_bn=True, dropout=dropout),
+            MLP1d(hidden, dim, use_bn=True, dropout=dropout),
+        )
+        self.ffn_res = Residual(dim, dim)
 
-    def forward(self, x: torch.Tensor):
-        """
-        x: (B, N, C)
-        """
-        B, N, C = x.shape
-        # project
-        Q = self.q(x)
-        K = self.k(x)
-        V = self.v(x)
-        Q = torch.nan_to_num(Q)
-        K = torch.nan_to_num(K)
-        V = torch.nan_to_num(V)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 自注意力残差
+        y = self.attn(x)
+        x = self.attn_res(x, y)
+        # FFN 残差
+        y = self.ffn(x)
+        x = self.ffn_res(x, y)
+        return x
 
-        # KV cache (scale by N to keep magnitude)
-        # (bnd,bnc->bdc) / N
-        KV = torch.einsum('bnd,bnc->bdc', K, V) / max(1, N)
-        KV = torch.nan_to_num(KV)
 
-        # aggregate: (bnd,bdc->bnc)
-        out = torch.einsum('bnd,bdc->bnc', Q, KV)
-        out = torch.nan_to_num(out)
+# ------------------------------------------------------------
+# 金字塔/层级块（示例）：局部聚合 + 全局注意力
+# ------------------------------------------------------------
+class LocalGlobalFusionBlock(nn.Module):
+    """
+    一个典型层：局部动态半径通道融合 + 全局注意力
+    输入/输出: [B, C, N]
+    """
+    def __init__(
+        self,
+        c_in: int,
+        c_mid: Optional[int] = None,
+        c_out: Optional[int] = None,
+        k: int = 16,
+        tau: float = 0.2,
+        heads: int = 4,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        c_mid = c_mid or c_in
+        c_out = c_out or c_in
 
-        # denom = <Q, sum(K)> (per token), lower-bounded
-        Ksum = K.sum(dim=1, keepdim=True)                               # (B,1,Dk)
-        denom = (Q * Ksum).sum(dim=-1, keepdim=True).abs()              # (B,N,1)
-        denom = torch.clamp(denom, min=_STABLE_EPS)
+        self.local = DynamicRadiusChannelFusion(
+            c_in=c_in, c_hidden=c_mid, c_out=c_out, k=k, tau=tau, dropout=dropout
+        )
+        self.global_attn = LinearSpatialGVA(
+            dim=c_out, num_heads=heads, mlp_ratio=2.0, attn_drop=0.0, proj_drop=dropout, dropout=dropout
+        )
 
-        out = out / denom
-        out = torch.nan_to_num(out)
+    def forward(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        x = self.local(x, pos)            # [B, C_out, N]
+        x = self.global_attn(x)           # [B, C_out, N]
+        return x
 
-        if Config.ENABLE_FEATURE_DROP:
-            out = feature_dropout(out, Config.FEATURE_DROP_PROB)
 
-        # residual + norm
-        out = self.res_scale(out) + x
-        out = self.post_norm(out)
+# ------------------------------------------------------------
+# 下采样封装（可供主干使用）
+# ------------------------------------------------------------
+class DownsampleWithHybridSampler(nn.Module):
+    """
+    通过混合采样（FPS+随机）下采样点集，并用 KNN 从原集聚合到子集特征。
+    输入:
+        x:   [B, C, N]
+        pos: [B, 3, N]
+        m:   目标点数
+    输出:
+        x_sub:   [B, C, m]
+        pos_sub: [B, 3, m]
+    """
+    def __init__(self, k: int = 16, fps_ratio: float = 0.7, tau: float = 0.2):
+        super().__init__()
+        self.k = k
+        self.fps_ratio = fps_ratio
+        self.tau = tau
 
-        out = self.dropout(out)
-        out = self.drop_path(out)
-        return out
+    def forward(self, x: torch.Tensor, pos: torch.Tensor, m: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        b, c, n = x.shape
+        m = min(m, n)
+        idx = hybrid_fps_random(pos, m=m, fps_ratio=self.fps_ratio)     # [B, m]
+        # 取子集坐标
+        pos_sub = torch.gather(pos, dim=2, index=idx.unsqueeze(1).expand(b, 3, m))  # [B, 3, m]
+
+        # 用子集坐标对原集 KNN，把原特征聚合到子集
+        with torch.no_grad():
+            # [B, m, N]
+            dist2 = torch.cdist(pos_sub.transpose(1, 2).contiguous(), pos.transpose(1, 2).contiguous(), p=2)
+            knn_idx = dist2.topk(k=self.k, largest=False)[1]                    # [B, m, k]
+
+        neigh_x = gather_neighbor(x, knn_idx)                                    # [B, C, m, k]
+        neigh_pos = gather_neighbor(pos, knn_idx)                                 # [B, 3, m, k]
+        pos_sub_expand = pos_sub.unsqueeze(-1).expand(b, 3, m, self.k)
+        d = torch.norm(neigh_pos - pos_sub_expand, dim=1)                        # [B, m, k]
+        d = torch.clamp(d, min=1e-6)
+        w = F.softmax(-d / max(1e-6, self.tau), dim=-1).unsqueeze(1)             # [B, 1, m, k]
+        x_sub = torch.sum(neigh_x * w, dim=-1)                                   # [B, C, m]
+        return x_sub, pos_sub
