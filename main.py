@@ -6,8 +6,8 @@ import torch
 import torch.backends.cudnn as cudnn
 
 from config import Config
-from point_cloud_dataset import PointCloudDataset
-from sgdat import SGDAT
+from datasets.point_cloud_dataset import PointCloudDataset
+from models.sgdat import SGDAT
 from trainer import Trainer
 
 
