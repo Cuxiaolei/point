@@ -19,15 +19,23 @@ class Trainer:
     - AMP + grad clipping（可通过 config 控制）
     """
 
-    def __init__(self, model, config, train_dataset, val_dataset):
+    def __init__(self, model, config, train_dataset, val_dataset, class_weights=None):
         self.model = model.to(config.DEVICE)
         self.config = config
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.device = config.DEVICE
 
+        # 如果传入了 class_weights，就放到 GPU
+        if class_weights is not None:
+            self.class_weights = torch.tensor(class_weights, dtype=torch.float32, device=self.device)
+        else:
+            self.class_weights = None
+
         # AMP scaler（在 cuda 时启用）
         self.scaler = GradScaler() if self.device.startswith('cuda') else None
+
+
 
         # 最大点数来自 dataset（默认回退）
         self.max_points = getattr(train_dataset, 'max_points', 20000)
