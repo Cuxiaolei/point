@@ -135,7 +135,14 @@ class Trainer:
             self.optimizer.zero_grad()
             # forward + loss (with AMP)
             with autocast(device_type='cuda', enabled=self.scaler is not None):
-                loss, logits = self.model.get_loss(points, labels, ignore_index=-1, class_weights=self.class_weights)
+                loss, logits, stats = self.model.get_loss(
+                    points, labels,
+                    class_weights=self.class_weights if hasattr(self, 'class_weights') else None,
+                    ignore_index=-1,
+                    aux_weight=0.4,
+                    label_smoothing=0.05,
+                    focal_gamma=1.5,  # 如需更平稳，先设 0 试试；类别极不均衡可 >=1
+                )
 
             # numeric check
             if torch.isnan(loss) or torch.isinf(loss):
@@ -217,7 +224,14 @@ class Trainer:
                     continue
 
                 with autocast(device_type='cuda', enabled=self.scaler is not None):
-                    loss, logits = self.model.get_loss(points, labels, ignore_index=-1, class_weights=self.class_weights)
+                    loss, logits, _ = self.model.get_loss(
+                        points, labels,
+                        class_weights=self.class_weights if hasattr(self, 'class_weights') else None,
+                        ignore_index=-1,
+                        aux_weight=0.4,
+                        label_smoothing=0.0,  # 验证不做 smoothing
+                        focal_gamma=0.0  # 验证不做 focal
+                    )
 
                 preds = logits.argmax(dim=-1)
                 mask = (labels != -1)
