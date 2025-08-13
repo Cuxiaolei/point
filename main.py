@@ -69,7 +69,7 @@ def main():
     class_weights = compute_class_weights(train_dataset, num_classes).to(config.DEVICE)
 
     # 初始化模型
-    model = SGDAT(num_classes=config.NUM_CLASSES, input_dim=9, base_dim=64, max_points=config.MAX_POINTS, debug=True)
+    model = SGDAT(num_classes=config.NUM_CLASSES, base_dim=64, max_points=config.MAX_POINTS, debug=True)
 
     # 打印参数
     total_params = sum(p.numel() for p in model.parameters())
