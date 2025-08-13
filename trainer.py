@@ -484,7 +484,7 @@ class Trainer:
                         logits = self.model(points)
                     # 一次性 logits NaN 告警（可关）
                     if (not self._logits_nan_warned) and _cfg_val(self.config, "DET_COLLECT_LOGITS_NAN_ONCE"):
-                        if (not torch.isfinite(logits)).any():
+                        if not torch.isfinite(logits).all().item():
                             self._logits_nan_warned = True
                             self.logger.warning("[NaN Debug] 在 logits 中检测到 NaN/Inf。")
 
