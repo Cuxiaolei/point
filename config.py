@@ -19,7 +19,7 @@ class Config:
         self.DEVICE = "cuda"
 
         # 新增参数：是否限制每个样本的点数
-        self.LIMIT_POINTS = True
+        self.LIMIT_POINTS = False
         self.MAX_POINTS = 8000  # 仅当 LIMIT_POINTS=True 时生效
 
         # 数据增强
