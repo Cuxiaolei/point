@@ -19,7 +19,7 @@ class Config:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
     # 限制每个样本点数
-    LIMIT_POINTS = True
+    LIMIT_POINTS = False
     MAX_POINTS = 8000
 
     # 数据增强
