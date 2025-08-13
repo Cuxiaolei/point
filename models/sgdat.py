@@ -66,23 +66,24 @@ def knn_indices(query_xyz: torch.Tensor, ref_xyz: torch.Tensor, k: int):
     return idx
 
 
-def batched_index_points(points: torch.Tensor, idx: torch.Tensor):
+def batched_index_points(points, idx):
     """
-    根据批量索引提取点/特征
-    points: (B, N, C)
-    idx:    (B, M, k) 或 (B, M)
-    return: (B, M, k, C) 或 (B, M, C)
+    points: [B, N, C]
+    idx: [B, M] or [B, M, K]
+    return: [B, M, C] or [B, M, K, C]
     """
+    device = points.device
     B = points.shape[0]
-    batch_indices = torch.arange(B, dtype=torch.long, device=points.device).view(B, 1, 1)
-    if idx.ndim == 3:
-        B, M, K = idx.shape
-        batch_indices = batch_indices.expand(-1, M, K)
-        return points[batch_indices, idx, :]
-    else:
-        B, M = idx.shape
-        batch_indices = batch_indices.expand(-1, M)
-        return points[batch_indices, idx, :]
+
+    # 生成 batch 维索引，与 idx 维度对齐
+    view_shape = list(idx.shape)
+    view_shape[1:] = [1] * (len(view_shape) - 1)  # [B, 1] or [B, 1, 1]
+    batch_indices = torch.arange(B, dtype=torch.long, device=device).view(view_shape)
+
+    # expand 到 idx 的形状
+    batch_indices = batch_indices.expand_as(idx)
+
+    return points[batch_indices, idx, :]
 
 
 # -------------------------
