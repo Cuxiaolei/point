@@ -38,24 +38,34 @@ class Config:
     MODEL_SAVE_DIR = f"checkpoints/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     # ================== 反过拟合策略开关 ==================
-    ENABLE_DROPOUT = True  # 控制Dropout
+    ENABLE_DROPOUT = True
     DROPOUT_RATE = 0.3
 
-    ENABLE_DROPPATH = True  # 控制DropPath
+    ENABLE_DROPPATH = True
     DROPPATH_PROB = 0.1
 
-    ENABLE_FEATURE_DROP = True  # 随机丢弃特征
+    ENABLE_FEATURE_DROP = True
     FEATURE_DROP_PROB = 0.15
 
-    ENABLE_LABEL_SMOOTH = True  # 标签平滑
+    ENABLE_LABEL_SMOOTH = True
     LABEL_SMOOTH_FACTOR = 0.1
 
-    ENABLE_FOCAL_LOSS = True  # Focal Loss
+    ENABLE_FOCAL_LOSS = True
     FOCAL_GAMMA = 2.0
     FOCAL_ALPHA = 0.25
 
-    ENABLE_TEMP_SCALING = True  # 温度缩放
+    ENABLE_TEMP_SCALING = True
     TEMP_FACTOR = 1.5
+
+    # ================== 轻量注意力 / 融合组件开关 ==================
+    ENABLE_CHANNEL_CCC = True              # 通道注意力 CCC
+    ENABLE_DYNAMIC_FUSION = True           # 动态邻域-通道融合
+    ENABLE_LINEAR_GVA = True               # 线性空间 GVA
+
+    # 动态邻域参数
+    DYN_NEIGHBORS = 16
+    DYN_MIN_RADIUS = 0.02
+    DYN_MAX_RADIUS = 0.30
 
 
     def print_config(self):

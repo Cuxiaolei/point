@@ -48,7 +48,7 @@ def main():
     # 加载配置
     config = Config()
 
-    # 数据集（保持你的 PointCloudDataset 的参数签名）
+    # 数据集
     train_dataset = PointCloudDataset(
         config.DATA_ROOT,
         split="train",
@@ -68,7 +68,7 @@ def main():
         max_points=config.MAX_POINTS if config.LIMIT_POINTS else None
     )
 
-    # 类别数自动推断（仍然会被 config.NUM_CLASSES 覆盖/更新）
+    # 类别数自动推断
     num_classes = infer_num_classes_from_dataset(train_dataset, val_dataset)
     print(f"[INFO] Inferred num_classes = {num_classes}")
     config.NUM_CLASSES = num_classes
@@ -76,15 +76,20 @@ def main():
     # 类别权重
     class_weights = compute_class_weights(train_dataset, num_classes).to(config.DEVICE)
 
-    # =========================
-    # 初始化模型：所有“反过拟合”参数都从 Config 读取，并显式传入 SGDAT
-    # =========================
+    # 反过拟合与模块开关参数
     dropout_p = config.DROPOUT_RATE if getattr(config, "ENABLE_DROPOUT", False) else 0.0
     droppath_prob = config.DROPPATH_PROB if getattr(config, "ENABLE_DROPPATH", False) else 0.0
-    # 若只提供了一个 FEATURE_DROP_PROB，就对 RGB/Normal 使用同一个概率
     feat_drop_p = config.FEATURE_DROP_PROB if getattr(config, "ENABLE_FEATURE_DROP", False) else 0.0
     logit_temp = config.TEMP_FACTOR if getattr(config, "ENABLE_TEMP_SCALING", False) else 1.0
+
+    # 新增：动态融合与线性 GVA 开关 + 超参
     use_channel_ccc = getattr(config, "ENABLE_CHANNEL_CCC", False)
+    use_dynamic_fusion = getattr(config, "ENABLE_DYNAMIC_FUSION", True)
+    use_linear_gva = getattr(config, "ENABLE_LINEAR_GVA", True)
+
+    dyn_neighbors = getattr(config, "DYN_NEIGHBORS", 16)
+    dyn_rmin = getattr(config, "DYN_MIN_RADIUS", 0.02)
+    dyn_rmax = getattr(config, "DYN_MAX_RADIUS", 0.30)
 
     model = SGDAT(
         num_classes=config.NUM_CLASSES,
@@ -96,7 +101,13 @@ def main():
         drop_rgb_p=feat_drop_p,
         drop_normal_p=feat_drop_p,
         logit_temp=logit_temp,
-        use_channel_ccc=use_channel_ccc
+        use_channel_ccc=use_channel_ccc,
+        # 新增：模块接入开关与参数
+        use_dynamic_fusion=use_dynamic_fusion,
+        use_linear_gva=use_linear_gva,
+        dyn_neighbors=dyn_neighbors,
+        dyn_min_radius=dyn_rmin,
+        dyn_max_radius=dyn_rmax
     )
 
     # 打印参数
@@ -105,7 +116,7 @@ def main():
     print(f"模型总参数: {total_params:,}")
     print(f"可训练参数: {trainable_params:,}")
 
-    # 初始化 Trainer（反过拟合策略：如标签平滑与 Focal 在 Trainer/损失处启用）
+    # 训练器
     trainer = Trainer(model, config, train_dataset, val_dataset, class_weights=class_weights)
     trainer.train()
 
