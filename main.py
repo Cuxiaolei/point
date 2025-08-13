@@ -4,7 +4,7 @@ import os
 import collections
 
 from models.sgdat import SGDAT
-from datasets.point_cloud_dataset import PointCloudDataset, PointCloudTransform
+from datasets.point_cloud_dataset import PointCloudDataset
 from trainer import Trainer
 from config import Config
 
@@ -48,17 +48,25 @@ def main():
     # 加载配置
     config = Config()
 
-    # 数据增强
-    transform = PointCloudTransform(
+    # 数据集
+    train_dataset = PointCloudDataset(
+        config.DATA_ROOT,
+        split="train",
         rotation=config.ROTATION_AUG,
         scale=config.SCALE_AUG,
         noise=config.NOISE_AUG,
-        translate=config.TRANSFORM_AUG
+        translate=config.TRANSFORM_AUG,
+        max_points=config.MAX_POINTS if config.LIMIT_MAX_POINTS else None
     )
-
-    # 数据集
-    train_dataset = PointCloudDataset(config.DATA_ROOT, split="train", transform=transform, max_points=config.MAX_POINTS)
-    val_dataset = PointCloudDataset(config.DATA_ROOT, split="val", transform=None, max_points=config.MAX_POINTS)
+    val_dataset = PointCloudDataset(
+        config.DATA_ROOT,
+        split="val",
+        rotation=False,
+        scale=False,
+        noise=False,
+        translate=False,
+        max_points=config.MAX_POINTS if config.LIMIT_MAX_POINTS else None
+    )
 
     # 类别数
     num_classes = infer_num_classes_from_dataset(train_dataset, val_dataset)
@@ -69,7 +77,12 @@ def main():
     class_weights = compute_class_weights(train_dataset, num_classes).to(config.DEVICE)
 
     # 初始化模型
-    model = SGDAT(num_classes=config.NUM_CLASSES, base_dim=64, max_points=config.MAX_POINTS, debug=True)
+    model = SGDAT(
+        num_classes=config.NUM_CLASSES,
+        base_dim=64,
+        max_points=(config.MAX_POINTS if config.LIMIT_MAX_POINTS else None),
+        debug=True
+    )
 
     # 打印参数
     total_params = sum(p.numel() for p in model.parameters())
