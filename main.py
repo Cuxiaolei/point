@@ -4,7 +4,7 @@ import os
 import collections
 
 from models.sgdat import SGDAT
-from datasets.point_cloud_dataset import PointCloudDataset, PointCloudTransform
+from datasets.point_cloud_dataset import PointCloudDataset
 from trainer import Trainer
 from config import Config
 
@@ -47,14 +47,6 @@ def main():
 
     # 加载配置
     config = Config()
-
-    # 数据增强（与你现有的数据集接口保持一致）
-    transform = PointCloudTransform(
-        rotation=config.ROTATION_AUG,
-        scale=config.SCALE_AUG,
-        noise=config.NOISE_AUG,
-        translate=config.TRANSFORM_AUG
-    )
 
     # 数据集（保持你的 PointCloudDataset 的参数签名）
     train_dataset = PointCloudDataset(
