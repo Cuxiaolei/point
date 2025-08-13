@@ -48,8 +48,10 @@ class Trainer:
 
         # 最大点数（只在 LIMIT_POINTS=True 时生效）
         self.max_points = getattr(config, 'MAX_POINTS', 20000)
-        print(f"训练器初始化：{'限制最大点数 ' + str(self.max_points) if config.LIMIT_POINTS else '不限制点数'}")
+        if config.LIMIT_POINTS:
+            print(f"训练器初始化：限制最大点数 {self.max_points}")
 
+        # 自定义 collate
         def custom_collate(batch):
             points_list = [item[0] for item in batch]
             labels_list = [item[1] for item in batch]
@@ -108,7 +110,6 @@ class Trainer:
         print(f"[Trainer] class_weights: {self.class_weights}")
         config.print_config()
 
-
     def _compute_class_weights(self):
         counts = np.zeros(self.config.NUM_CLASSES, dtype=np.int64)
         for scene in self.train_dataset.scene_list:
@@ -124,7 +125,6 @@ class Trainer:
         weights = inv / inv.sum() * float(self.config.NUM_CLASSES)
         weights = np.where(np.isfinite(weights), weights, 1.0)
         return torch.tensor(weights, dtype=torch.float32).to(self.device)
-
     def train_epoch(self, epoch):
         self.model.train()
         total_loss = 0.0
