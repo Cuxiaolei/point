@@ -305,23 +305,15 @@ class SGDAT(nn.Module):
 
         return logits  # (B, N, num_classes)
 
-    def get_loss(self, points: torch.Tensor, labels: torch.Tensor, ignore_index: int = -1):
+    def get_loss(self, logits, labels, class_weights=None):
         """
-        points: (B, N, C)  — 期望 9 维（xyz+rgb+normal）
-        labels: (B, N)
-        返回: (loss, logits)
+        logits: [B, N, num_classes]
+        labels: [B, N]
         """
-        logits = self.forward(points)  # (B,N,num_classes)
-        # 交叉熵
-        if self.class_weights is not None:
-            weight = self.class_weights.to(points.device, dtype=points.dtype)
-        else:
-            weight = None
+        loss_fn = nn.CrossEntropyLoss(weight=class_weights, ignore_index=-1)
+        loss = loss_fn(logits.view(-1, logits.shape[-1]), labels.view(-1))
+        preds = torch.argmax(logits, dim=-1)
+        acc = (preds == labels).float()
+        acc = acc[labels != -1].mean()  # 忽略 padding
+        return loss, preds, {"acc": acc.item()}
 
-        loss = F.cross_entropy(
-            logits.reshape(-1, self.num_classes),
-            labels.reshape(-1),
-            ignore_index=ignore_index,
-            weight=weight
-        )
-        return loss, logits
