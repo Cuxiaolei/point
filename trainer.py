@@ -26,6 +26,11 @@ DEFAULTS = {
     "POINTCUTMIX_ENABLE": False,
     "POINTCUTMIX_PROB": 0.1,
     "POINTCUTMIX_RATIO": 0.2,
+    "ENABLE_SOFT_DICE": False,
+    "SOFT_DICE_EPS": 1e-6,
+    "SOFT_DICE_WEIGHT": 0.5,
+    "ENABLE_TEMP_SCALING": False,
+    "TEMP_FACTOR": 1.5,
 }
 
 def _cfg_val(cfg, key):
@@ -317,12 +322,50 @@ class Trainer:
         labels = torch.where(valid_mask, labels, torch.full_like(labels, -1))
         return points, labels
 
+    def _apply_temp(self, logits):
+        """可选温度缩放：降低过度自信，提高稳定性/兼容轻量注意力输出"""
+        if _cfg_val(self.config, "ENABLE_TEMP_SCALING"):
+            T = float(max(1e-6, _cfg_val(self.config, "TEMP_FACTOR")))
+            return logits / T
+        return logits
+
+    def _soft_dice_loss(self, logits, labels, num_classes, ignore_index=-1, eps=1e-6):
+        """可选 soft dice，点级 one-vs-rest，忽略 label=-1 的 pad。返回标量。"""
+        # logits -> probs
+        probs = torch.softmax(logits, dim=-1)  # (B,N,K)
+        B, N, K = probs.shape
+        mask = (labels != ignore_index).float()  # (B,N)
+        if mask.sum() == 0:
+            return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+
+        dice_sum = 0.0
+        valid_c = 0
+        # 展平到 (B*N, K) 同时带掩码
+        probs = probs.reshape(B * N, K)
+        labels = labels.reshape(B * N)
+        mask = mask.reshape(B * N)
+
+        for c in range(num_classes):
+            target = (labels == c).float() * mask
+            pred   = probs[:, c] * mask
+            inter = (pred * target).sum()
+            denom = pred.sum() + target.sum() + eps
+            dice_c = (2 * inter + eps) / denom
+            dice_sum += (1.0 - dice_c)  # 损失 = 1 - dice
+            valid_c += 1
+        if valid_c == 0:
+            return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+        return dice_sum / valid_c
+
     def _fallback_loss(self, logits, labels,
                        class_weights=None, ignore_index=-1,
                        label_smoothing=0.0, focal_gamma=0.0):
         """
-        当模型暂时没有 get_loss 时的稳健回退 CE/Focal 组合（与验证端一致）
+        当模型暂时没有 get_loss 时的稳健回退 CE/Focal + （可选）Soft-Dice 组合
         """
+        # 温度缩放（与验证端保持一致）
+        logits = self._apply_temp(logits)
+
         # 展平
         B, N, K = logits.shape
         x = logits.reshape(B * N, K)
@@ -344,7 +387,21 @@ class Trainer:
                 pt = torch.where(mask, pt, torch.ones_like(pt))
                 focal_w = (1 - pt) ** focal_gamma
             ce = (ce * focal_w.mean())  # 标量缩放（避免与ignore_index冲突）
-        return ce
+
+        loss = ce
+
+        # 组合 Soft-Dice
+        if _cfg_val(self.config, "ENABLE_SOFT_DICE"):
+            dice = self._soft_dice_loss(
+                logits.view(B, N, K), labels.view(B, N),
+                num_classes=K,
+                ignore_index=ignore_index,
+                eps=_cfg_val(self.config, "SOFT_DICE_EPS"),
+            )
+            w = float(_cfg_val(self.config, "SOFT_DICE_WEIGHT"))
+            loss = (1.0 - w) * loss + w * dice
+
+        return loss
 
     def _miou_from_labels_preds(self, labels_list, preds_list, num_classes):
         """从累积的标签/预测计算 per-class IoU 与 mIoU"""
@@ -412,19 +469,22 @@ class Trainer:
                         points, labels,
                         class_weights=self.class_weights if hasattr(self, 'class_weights') else None,
                         ignore_index=-1,
-                        aux_weight=0.4,
-                        label_smoothing=0.05,
-                        focal_gamma=1.5,
+                        aux_weight=getattr(self.config, "SEMANTIC_AUX_LOSS_WEIGHT", 0.4),
+                        label_smoothing=(self.config.LABEL_SMOOTH_FACTOR if getattr(self.config, "ENABLE_LABEL_SMOOTH", True) else 0.0),
+                        focal_gamma=(self.config.FOCAL_GAMMA if getattr(self.config, "ENABLE_FOCAL_LOSS", True) else 0.0),
                     )
                 else:
                     logits = self.model(points)
+                    # 温度缩放 + 组合损失
                     loss = self._fallback_loss(
                         logits, labels,
                         class_weights=self.class_weights if hasattr(self, 'class_weights') else None,
                         ignore_index=-1,
-                        label_smoothing=0.05,
-                        focal_gamma=1.5
+                        label_smoothing=(self.config.LABEL_SMOOTH_FACTOR if getattr(self.config, "ENABLE_LABEL_SMOOTH", True) else 0.0),
+                        focal_gamma=(self.config.FOCAL_GAMMA if getattr(self.config, "ENABLE_FOCAL_LOSS", True) else 0.0)
                     )
+                    # 确保 logits 经过温度以便后续指标一致
+                    logits = self._apply_temp(logits)
 
             # 数值检查
             if (not torch.isfinite(loss)) or (loss.item() > _cfg_val(self.config, "SKIP_STEP_LOSS_THRESH")):
@@ -484,6 +544,7 @@ class Trainer:
                     # 有些模型的 get_loss 已返回 logits；保守处理：必要时再前向一次
                     if 'logits' not in locals() or logits is None:
                         logits = self.model(points)
+                        logits = self._apply_temp(logits)
                     # 一次性 logits NaN 告警（可关）
                     if (not self._logits_nan_warned) and _cfg_val(self.config, "DET_COLLECT_LOGITS_NAN_ONCE"):
                         if not torch.isfinite(logits).all().item():
@@ -570,7 +631,7 @@ class Trainer:
                             points, labels,
                             class_weights=self.class_weights if hasattr(self, 'class_weights') else None,
                             ignore_index=-1,
-                            aux_weight=0.4,
+                            aux_weight=getattr(self.config, "SEMANTIC_AUX_LOSS_WEIGHT", 0.4),
                             label_smoothing=0.0,
                             focal_gamma=0.0
                         )
@@ -583,6 +644,7 @@ class Trainer:
                             label_smoothing=0.0,
                             focal_gamma=0.0
                         )
+                        logits = self._apply_temp(logits)
 
                 preds = logits.argmax(dim=-1)
                 mask = (labels != -1)

@@ -34,6 +34,12 @@ class Config:
     NOISE_AUG     = True
     TRANSFORM_AUG = True
 
+    # 数据值规范化（数据集读取时使用）
+    INPUT_NORM      = True      # 对每个样本的 XYZ 做零均值/单位范数
+    COLOR_MODE      = "auto"    # {"auto","01","255"}: auto 自动判断是否需 /255
+    NORMAL_UNIT     = True      # 法向量是否重新单位化
+    INPUT_DIM       = 9         # [x,y,z | r,g,b | nx,ny,nz]，供模型/数据一致性参考
+
     # 训练期“反过拟合”策略（Trainer 会直接读取）
     POINT_DROPOUT_ENABLE = True
     POINT_DROPOUT_RATE   = 0.08
@@ -43,7 +49,6 @@ class Config:
     POINTCUTMIX_RATIO    = 0.20
 
     # ================== 稳定训练相关 ==================
-    INPUT_NORM     = True      # 对每个样本的 XYZ 做零均值/单位方差标准化（数据侧使用）
     CLIP_NORM      = 2.0
     SEED           = 42
     DETERMINISTIC  = False
@@ -65,12 +70,28 @@ class Config:
     FOCAL_GAMMA          = 1.5
     FOCAL_ALPHA          = 0.25
 
-    ENABLE_SOFT_DICE     = True  # 新增：可选的 soft dice（逐点分割友好）
+    ENABLE_SOFT_DICE     = True  # 可选：soft dice（逐点分割友好）
     SOFT_DICE_EPS        = 1e-6
     SOFT_DICE_WEIGHT     = 0.5   # dice 的权重（和 CE/Focal 组合）
 
-    ENABLE_TEMP_SCALING  = True
+    ENABLE_TEMP_SCALING  = True  # 温度缩放（更平滑的 logits，利于稳定）
     TEMP_FACTOR          = 1.5
+
+    # ====== 与模型文件（SGDAT / modules_sgdat）适配的关键开关 ======
+    # —— 动态邻域 + 通道融合
+    ENABLE_DYNAMIC_NEIGHBOR = True
+    KNN_K_BASE              = 16
+    KNN_K_MAX               = 32
+    NEIGHBOR_ADAPTIVE       = True     # 动态邻域自适应策略开关
+    ENABLE_CHANNEL_FUSION   = True     # 通道融合（Channel Fusion）
+
+    # —— 语义引导的全尺度融合
+    ENABLE_SEMANTIC_GUIDANCE = True
+    SEMANTIC_AUX_LOSS_WEIGHT = 0.4     # 若模型内部有语义辅助头，可沿用该比重
+
+    # —— 轻量化注意力：CAA + 线性 GVA
+    ATTN_USE_CAA        = True   # CAA 中 CCC 子模块的通道相似度思想
+    ATTN_USE_LINEAR_GVA = True   # 线性编码的 GVA，替代 CAE 中 softmax
 
     # ================== EMA / 早停 ==================
     EMA_ENABLE = True

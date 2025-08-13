@@ -98,10 +98,8 @@ def knn_indices(coords: torch.Tensor, k: int) -> torch.Tensor:
     return: idx [B, N, k]
     """
     b, _, n = coords.shape
-    # [B, N, N]
     with torch.no_grad():
         dist2 = torch.cdist(coords.transpose(1, 2).contiguous(), coords.transpose(1, 2).contiguous(), p=2)
-        # 取最近邻（包含自身）
         idx = dist2.topk(k=k, largest=False)[1]   # [B, N, k]
     return idx
 
@@ -116,7 +114,6 @@ def gather_neighbor(feat: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     k = idx.shape[-1]
     idx_expand = idx.unsqueeze(1).expand(b, c, n, k)  # [B, C, N, K]
     feat_expand = feat.unsqueeze(2).expand(b, c, n, n)
-    # 使用 take_along_dim 选取邻域特征
     neigh = torch.take_along_dim(feat_expand, idx_expand, dim=3)  # [B, C, N, K]
     return neigh
 
@@ -133,12 +130,10 @@ def hybrid_fps_random(xyz: torch.Tensor, m: int, fps_ratio: float = 0.7) -> torc
     fps_m = int(m * fps_ratio)
     rand_m = m - fps_m
 
-    # --- FPS 简化实现（朴素 O(B*N*m)），在 N 较大时可用更高效实现 ---
     with torch.no_grad():
         idxs = []
         for bi in range(b):
             pts = xyz[bi].transpose(0, 1).contiguous()  # [N, 3]
-            # 随机初始化一个中心
             farthest = torch.randint(0, n, (1,), device=device)
             centroids = [farthest.item()]
             dist = torch.full((n,), 1e10, device=device)
@@ -154,10 +149,8 @@ def hybrid_fps_random(xyz: torch.Tensor, m: int, fps_ratio: float = 0.7) -> torc
                 out = torch.cat([centroids, rand_idx], dim=0)
             else:
                 out = centroids
-            # 去重 & 截断
             out = torch.unique_consecutive(out)[:m]
             if out.numel() < m:
-                # 不足则补随机
                 need = m - out.numel()
                 extra = torch.randperm(n, device=device)[:need]
                 out = torch.cat([out, extra], dim=0)
@@ -198,7 +191,6 @@ class DynamicRadiusChannelFusion(nn.Module):
         self.k = k
         self.tau = tau
 
-        # 邻域增强后的通道融合
         self.channel_proj = nn.Sequential(
             MLP1d(c_in * 2, c_hidden, use_bn=True, dropout=dropout),
             MLP1d(c_hidden, c_out, use_bn=True, dropout=dropout),
@@ -207,30 +199,24 @@ class DynamicRadiusChannelFusion(nn.Module):
         self.res = Residual(c_in, c_out)
 
     def forward(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-        # 保护数值
         x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
         pos = torch.nan_to_num(pos, nan=0.0, posinf=1e4, neginf=-1e4)
 
         b, c, n = x.shape
-        # KNN
         idx = knn_indices(pos, k=self.k)  # [B, N, k]
-        # 邻域特征
         neigh_x = gather_neighbor(x, idx)  # [B, C, N, k]
-        # 邻域坐标用于计算距离
+
         pos_expand = pos.unsqueeze(-1).expand(b, 3, n, self.k)             # [B, 3, N, k]
         neigh_pos = gather_neighbor(pos, idx)                               # [B, 3, N, k]
         d = torch.norm(neigh_pos - pos_expand, dim=1)                       # [B, N, k]
         d = torch.clamp(d, min=1e-6)
-        # 权重：softmax(-d/τ)
         w = F.softmax(-d / max(1e-6, self.tau), dim=-1).unsqueeze(1)        # [B, 1, N, k]
-        # 加权聚合
         agg = torch.sum(neigh_x * w, dim=-1)                                # [B, C, N]
 
-        # 拼接 (x || agg) 进行通道融合
         fuse = torch.cat([x, agg], dim=1)                                   # [B, 2C, N]
         y = self.channel_proj(fuse)                                         # [B, C_out, N]
         y = self.se(y)
-        y = self.res(x, y)                                                  # 残差
+        y = self.res(x, y)
         return y
 
 
@@ -240,7 +226,6 @@ class DynamicRadiusChannelFusion(nn.Module):
 class MultiHeadSelfAttention1D(nn.Module):
     """
     多头自注意力（简化版），输入为 [B, C, N]，输出同形状。
-    默认使用缩放点积注意力；为了鲁棒性，对 logits/attn 做了 clamp。
     """
     def __init__(
         self,
@@ -264,19 +249,17 @@ class MultiHeadSelfAttention1D(nn.Module):
         self.apply(init_linear)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C, N] -> 转为 [B, N, C]
-        x_ = x.transpose(1, 2).contiguous()         # [B, N, C]
+        # x: [B, C, N] -> [B, N, C]
+        x_ = x.transpose(1, 2).contiguous()
         b, n, c = x_.shape
 
         qkv = self.qkv(x_)                          # [B, N, 3C]
         q, k, v = qkv.chunk(3, dim=-1)              # [B, N, C] * 3
 
-        # 分头
         q = q.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, N, Dh]
-        k = k.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, N, Dh]
-        v = v.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, N, Dh]
+        k = k.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # 缩放点积注意力
         attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale   # [B, H, N, N]
         attn_logits = torch.nan_to_num(attn_logits, nan=0.0, posinf=1e4, neginf=-1e4)
         attn = F.softmax(attn_logits, dim=-1)
@@ -287,8 +270,7 @@ class MultiHeadSelfAttention1D(nn.Module):
         out = self.proj(out)
         out = self.proj_drop(out)
 
-        # 回到 [B, C, N]
-        out = out.transpose(1, 2).contiguous()
+        out = out.transpose(1, 2).contiguous()                            # [B, C, N]
         return out
 
 
@@ -324,47 +306,10 @@ class LinearSpatialGVA(nn.Module):
         self.ffn_res = Residual(dim, dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 自注意力残差
         y = self.attn(x)
         x = self.attn_res(x, y)
-        # FFN 残差
         y = self.ffn(x)
         x = self.ffn_res(x, y)
-        return x
-
-
-# ------------------------------------------------------------
-# 金字塔/层级块（示例）：局部聚合 + 全局注意力
-# ------------------------------------------------------------
-class LocalGlobalFusionBlock(nn.Module):
-    """
-    一个典型层：局部动态半径通道融合 + 全局注意力
-    输入/输出: [B, C, N]
-    """
-    def __init__(
-        self,
-        c_in: int,
-        c_mid: Optional[int] = None,
-        c_out: Optional[int] = None,
-        k: int = 16,
-        tau: float = 0.2,
-        heads: int = 4,
-        dropout: float = 0.0,
-    ):
-        super().__init__()
-        c_mid = c_mid or c_in
-        c_out = c_out or c_in
-
-        self.local = DynamicRadiusChannelFusion(
-            c_in=c_in, c_hidden=c_mid, c_out=c_out, k=k, tau=tau, dropout=dropout
-        )
-        self.global_attn = LinearSpatialGVA(
-            dim=c_out, num_heads=heads, mlp_ratio=2.0, attn_drop=0.0, proj_drop=dropout, dropout=dropout
-        )
-
-    def forward(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-        x = self.local(x, pos)            # [B, C_out, N]
-        x = self.global_attn(x)           # [B, C_out, N]
         return x
 
 
@@ -392,12 +337,9 @@ class DownsampleWithHybridSampler(nn.Module):
         b, c, n = x.shape
         m = min(m, n)
         idx = hybrid_fps_random(pos, m=m, fps_ratio=self.fps_ratio)     # [B, m]
-        # 取子集坐标
         pos_sub = torch.gather(pos, dim=2, index=idx.unsqueeze(1).expand(b, 3, m))  # [B, 3, m]
 
-        # 用子集坐标对原集 KNN，把原特征聚合到子集
         with torch.no_grad():
-            # [B, m, N]
             dist2 = torch.cdist(pos_sub.transpose(1, 2).contiguous(), pos.transpose(1, 2).contiguous(), p=2)
             knn_idx = dist2.topk(k=self.k, largest=False)[1]                    # [B, m, k]
 
@@ -409,3 +351,119 @@ class DownsampleWithHybridSampler(nn.Module):
         w = F.softmax(-d / max(1e-6, self.tau), dim=-1).unsqueeze(1)             # [B, 1, m, k]
         x_sub = torch.sum(neigh_x * w, dim=-1)                                   # [B, C, m]
         return x_sub, pos_sub
+
+
+# ============================================================
+# DropPath
+# ============================================================
+class DropPath(nn.Module):
+    """
+    Stochastic Depth / DropPath: 以概率 p 将输入乘以 0，并按(1-p)进行期望缩放。
+    输入输出同形状，通常包裹在残差分支上。
+    """
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob <= 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x / keep_prob * random_tensor
+
+
+# ============================================================
+# ChannelCCC（通道相关性注意力）
+# ============================================================
+class ChannelCCC(nn.Module):
+    """
+    基于通道相关性（相似度矩阵）的轻量注意力。
+    输入/输出: [B, C, N]
+    """
+    def __init__(self, channels: int, proj_ratio: float = 1.0, dropout: float = 0.0):
+        super().__init__()
+        c_proj = int(round(channels * proj_ratio))
+        self.proj_out = nn.Conv1d(channels, channels, kernel_size=1, bias=False)
+        nn.init.kaiming_normal_(self.proj_out.weight, mode="fan_out", nonlinearity="relu")
+        self.drop = nn.Dropout(dropout) if dropout > 1e-6 else nn.Identity()
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, n = x.shape
+        xm = x - x.mean(dim=-1, keepdim=True)
+        xn = F.normalize(xm, p=2, dim=-1)
+        G = torch.matmul(xn, xn.transpose(1, 2)) / max(1, n)  # [B, C, C]
+        G = torch.nan_to_num(G)
+        A = F.softmax(G, dim=-1)
+        y = torch.matmul(A, x)                                # [B, C, N]
+        y = self.proj_out(y)
+        y = self.drop(y)
+        return x + self.gamma * y
+
+
+# ============================================================
+# 跨尺度最近邻插值（channel-first）
+# ============================================================
+def nearest_interpolate(target_pos: torch.Tensor,
+                        source_pos: torch.Tensor,
+                        source_feat: torch.Tensor) -> torch.Tensor:
+    """
+    将 source_feat 从 source_pos 最近邻插值到 target_pos。
+    target_pos: [B, 3, Nt]
+    source_pos: [B, 3, Ns]
+    source_feat: [B, C, Ns]
+    return: [B, C, Nt]
+    """
+    b, _, nt = target_pos.shape
+    _, c, ns = source_feat.shape
+    with torch.no_grad():
+        dist = torch.cdist(target_pos.transpose(1, 2).contiguous(),
+                           source_pos.transpose(1, 2).contiguous(), p=2)  # [B, Nt, Ns]
+        idx = dist.argmin(dim=-1)  # [B, Nt]
+    idx_expand = idx.unsqueeze(1).expand(b, c, nt)  # [B, C, Nt]
+    out = torch.gather(source_feat, dim=2, index=idx_expand)
+    return out
+
+
+# ============================================================
+# 语义引导门控（SGF 的门控单元）
+# ============================================================
+class SemanticGuidedGate(nn.Module):
+    """
+    用粗尺度语义先验（logits 或 prob）对上采样分支进行空间门控。
+    典型用法：
+        # 128 尺度得到的 logits: sem128_logits [B, K, 128]
+        # 需要对 512 尺度的上采样特征进行门控：
+        gate_512 = sg_gate(sem_logits=sem128_logits,
+                           source_pos=xyz_128, target_pos=xyz_512)  # [B, 1, 512]
+        up128_to_512 = up128_to_512 * gate_512
+    """
+    def __init__(self, num_classes: int):
+        super().__init__()
+        self.conv = nn.Conv1d(num_classes, 1, kernel_size=1, bias=True)
+        nn.init.kaiming_normal_(self.conv.weight, mode="fan_out", nonlinearity="relu")
+        if self.conv.bias is not None:
+            nn.init.zeros_(self.conv.bias)
+        self.gate = nn.Sigmoid()
+
+    @torch.no_grad()
+    def _to_prob(self, sem_logits: torch.Tensor) -> torch.Tensor:
+        return F.softmax(sem_logits, dim=1)
+
+    def forward(self,
+                sem_logits: torch.Tensor,
+                source_pos: torch.Tensor,
+                target_pos: torch.Tensor) -> torch.Tensor:
+        """
+        sem_logits: [B, K, Ms]   （粗尺度）
+        source_pos: [B, 3, Ms]
+        target_pos: [B, 3, Nt]
+        return: gate [B, 1, Nt]
+        """
+        prob = self._to_prob(sem_logits)                 # [B, K, Ms]
+        prob_up = nearest_interpolate(target_pos, source_pos, prob)  # [B, K, Nt]
+        gate = self.gate(self.conv(prob_up))             # [B, 1, Nt]
+        return gate

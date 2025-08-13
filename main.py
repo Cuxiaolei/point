@@ -45,17 +45,24 @@ def main():
         print(f"[ERROR] 数据集路径不存在: {config.DATA_ROOT}")
         sys.exit(1)
 
-    # 数据集 —— 当 LIMIT_POINTS=False 时，不传 max_points
-    train_kwargs = dict(data_root=config.DATA_ROOT, split="train")
-    val_kwargs   = dict(data_root=config.DATA_ROOT, split="val")
-    if config.LIMIT_POINTS:
-        train_kwargs["max_points"] = config.MAX_POINTS
-        val_kwargs["max_points"] = config.MAX_POINTS
+    # 数据集 —— 根据 Config 的开关显式适配到你的 PointCloudDataset
+    # 当 LIMIT_POINTS=False 时，仍然传入 limit_points=False（不会裁剪）
+    common_ds_kwargs = dict(
+        rotation=config.ROTATION_AUG,
+        scale=config.SCALE_AUG,
+        noise=config.NOISE_AUG,
+        translate=config.TRANSFORM_AUG,
+        limit_points=config.LIMIT_POINTS,
+        max_points=config.MAX_POINTS,
+        normalize=config.INPUT_NORM,
+        color_mode=getattr(config, "COLOR_MODE", "auto"),
+        normal_unit=getattr(config, "NORMAL_UNIT", True),
+        num_classes=None if (config.NUM_CLASSES is None) else config.NUM_CLASSES
+    )
+    train_dataset = PointCloudDataset(data_root=config.DATA_ROOT, split="train", **common_ds_kwargs)
+    val_dataset   = PointCloudDataset(data_root=config.DATA_ROOT, split="val",   **common_ds_kwargs)
 
-    train_dataset = PointCloudDataset(**train_kwargs)
-    val_dataset   = PointCloudDataset(**val_kwargs)
-
-    # 自动推断类别数
+    # 自动推断类别数（保持原逻辑）
     if config.NUM_CLASSES is None:
         all_labels = []
         for ds in [train_dataset, val_dataset]:
@@ -68,7 +75,7 @@ def main():
         config.NUM_CLASSES = max(all_labels) + 1 if all_labels else 1
     print(f"[INFO] Inferred num_classes = {config.NUM_CLASSES}")
 
-    # 初始化模型
+    # 初始化模型（模型会读取 cfg 中的动态邻域/注意力/语义引导等开关）
     model = SGDAT(num_classes=config.NUM_CLASSES, cfg=config)
     model.apply(init_weights)
 
@@ -78,7 +85,7 @@ def main():
     print(f"模型总参数: {total_params:,}")
     print(f"可训练参数: {trainable_params:,}")
 
-    # 类别权重
+    # 类别权重（保留你原来的统计方式；Trainer 若未提供会自行回退计算）
     counts = np.zeros(config.NUM_CLASSES, dtype=np.float32)
     for scene in train_dataset.scene_list:
         seg_path = os.path.join(scene, "segment20.npy")

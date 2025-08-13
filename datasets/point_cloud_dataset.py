@@ -7,15 +7,20 @@ from math import isfinite
 class PointCloudDataset(Dataset):
     """
     每个场景目录下：
-      - coord.npy   (N,3)
-      - color.npy   (N,3)
-      - normal.npy  (N,3)
+      - coord.npy     (N,3)
+      - color.npy     (N,3)
+      - normal.npy    (N,3)
       - segment20.npy (N,)  # label, 取值 {0..K-1}，无 pad；pad 在 collate 里补 -1
+
+    新增适配项：
+      - color_mode: {"auto","01","255"}，默认 "auto"：若检测到颜色最大值>1，则 /255 归一化
+      - normal_unit: 是否对 normal 每行做单位化
     """
 
     def __init__(self, data_root, split="train",
                  rotation=False, scale=False, noise=False, translate=False,
-                 limit_points=True, max_points=20000, normalize=True, num_classes=None):
+                 limit_points=True, max_points=20000, normalize=True, num_classes=None,
+                 color_mode="auto", normal_unit=True):
         super().__init__()
         self.root_dir = os.path.join(data_root, split)
         self.scene_list = [os.path.join(self.root_dir, s) for s in sorted(os.listdir(self.root_dir))]
@@ -27,6 +32,10 @@ class PointCloudDataset(Dataset):
         self.max_points = max_points if (limit_points and max_points is not None) else None
         self.normalize = normalize
         self.num_classes = num_classes  # 用于检查标签合法性
+
+        # 新增：值域/单位化选项
+        self.color_mode = color_mode if color_mode in {"auto", "01", "255"} else "auto"
+        self.normal_unit = bool(normal_unit)
 
     def __len__(self):
         return len(self.scene_list)
@@ -59,6 +68,25 @@ class PointCloudDataset(Dataset):
             coords /= max_dist
         return coords.astype(np.float32)
 
+    def _normalize_color(self, color):
+        if self.color_mode == "255":
+            return color.astype(np.float32)
+        if self.color_mode == "01":
+            # 假设传入 0~255，做 /255
+            return (color.astype(np.float32) / 255.0).astype(np.float32)
+        # auto：如果出现 >1 的值，视为 0-255，做 /255
+        if np.max(color) > 1.0:
+            return (color.astype(np.float32) / 255.0).astype(np.float32)
+        return color.astype(np.float32)
+
+    def _unit_normal(self, normal):
+        if not self.normal_unit:
+            return normal.astype(np.float32)
+        n = normal.astype(np.float32)
+        norm = np.linalg.norm(n, axis=1, keepdims=True) + 1e-12
+        n = n / norm
+        return n.astype(np.float32)
+
     def __getitem__(self, idx):
         scene = self.scene_list[idx]
         coord = np.load(os.path.join(scene, "coord.npy")).astype(np.float32)    # (N,3)
@@ -75,9 +103,13 @@ class PointCloudDataset(Dataset):
         if self.rotation or self.scale or self.noise or self.translate:
             coord = self._augment(coord)
 
-        # 归一化
+        # 归一化（坐标）
         if self.normalize:
             coord = self._normalize_coords(coord)
+
+        # 新增：颜色/法向量规范化
+        color = self._normalize_color(color)
+        normal = self._unit_normal(normal)
 
         # 组装特征
         pts = np.concatenate([coord, color, normal], axis=1).astype(np.float32)  # (N,9)
