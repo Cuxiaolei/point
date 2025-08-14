@@ -263,23 +263,10 @@ class Trainer:
         # 记录最佳 val mIoU
         self.best_val_miou = 0.0
 
-        # 计算/设定 class weights
+        # 计算/设定 class weights（若外部未给）
         if self.class_weights is None:
-            self.class_weights, counts = self._compute_class_weights()
-        else:
-            # 若外部传入，仅统计一次 counts 用于先验（可选）
-            counts = None
+            self.class_weights = self._compute_class_weights()
         print(f"[Trainer] class_weights: {self.class_weights}")
-
-        # 用类别先验初始化分类器 bias（一次即可）
-        try:
-            if counts is not None and counts.sum() > 0:
-                priors = (counts / counts.sum()).astype(np.float32)
-                if hasattr(self.model, "set_class_priors"):
-                    self.model.set_class_priors(priors)
-                    print("[Trainer] 已根据训练集频率设置分类器先验 bias。")
-        except Exception as e:
-            print(f"[Trainer] 设置先验失败（忽略不中断）：{e}")
 
         # EMA
         self.ema = ModelEMA(self.model, decay=config.EMA_DECAY) if getattr(config, "EMA_ENABLE", False) else None

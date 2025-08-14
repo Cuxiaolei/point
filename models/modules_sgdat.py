@@ -444,104 +444,105 @@ class DropPath(nn.Module):
         self.drop_prob = float(drop_prob)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.drop_prob <= 0.0 or not self.training:
+        if (not self.training) or self.drop_prob <= 0.0:
             return x
         keep_prob = 1.0 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor.floor_()
-        return x / keep_prob * random_tensor
+        shape = (x.shape[0],) + (1,) * (x.dim() - 1)
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        out = x / keep_prob * random_tensor
+        return out
 
 
 # ============================================================
-# ChannelCCC（通道相关性注意力）
+# 最近邻插值（channel-first）
 # ============================================================
-class ChannelCCC(nn.Module):
+def nearest_interpolate(target_pos: torch.Tensor, source_pos: torch.Tensor, source_feat: torch.Tensor) -> torch.Tensor:
     """
-    基于通道相关性（相似度矩阵）的轻量注意力。
-    输入/输出: [B, C, N]
+    在 target_pos 上，从 source_pos 选最近邻并拷贝 source_feat。
+    输入:
+      target_pos: [B, 3, Nt]
+      source_pos: [B, 3, Ns]
+      source_feat:[B, C, Ns]
+    输出:
+      out: [B, C, Nt]
     """
-    def __init__(self, channels: int, proj_ratio: float = 1.0, dropout: float = 0.0):
-        super().__init__()
-        c_proj = int(round(channels * proj_ratio))
-        self.proj_out = nn.Conv1d(channels, channels, kernel_size=1, bias=False)
-        nn.init.kaiming_normal_(self.proj_out.weight, mode="fan_out", nonlinearity="relu")
-        self.drop = nn.Dropout(dropout) if dropout > 1e-6 else nn.Identity()
-        self.gamma = nn.Parameter(torch.zeros(1))
+    B, _, Nt = target_pos.shape
+    _, _, Ns = source_pos.shape
+    device = target_pos.device
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, n = x.shape
-        xm = x - x.mean(dim=-1, keepdim=True)
-        xn = F.normalize(xm, p=2, dim=-1)
-        G = torch.matmul(xn, xn.transpose(1, 2)) / max(1, n)  # [B, C, C]
-        G = torch.nan_to_num(G)
-        A = F.softmax(G, dim=-1)
-        y = torch.matmul(A, x)                                # [B, C, N]
-        y = self.proj_out(y)
-        y = self.drop(y)
-        return x + self.gamma * y
+    # [B,Nt,Ns]
+    dist2 = torch.cdist(target_pos.transpose(1, 2).contiguous(), source_pos.transpose(1, 2).contiguous(), p=2)
+    nn_idx = dist2.topk(k=1, largest=False)[1].squeeze(-1)  # [B, Nt]
 
-
-# ============================================================
-# 跨尺度最近邻插值（channel-first）
-# ============================================================
-def nearest_interpolate(target_pos: torch.Tensor,
-                        source_pos: torch.Tensor,
-                        source_feat: torch.Tensor) -> torch.Tensor:
-    """
-    将 source_feat 从 source_pos 最近邻插值到 target_pos。
-    target_pos: [B, 3, Nt]
-    source_pos: [B, 3, Ns]
-    source_feat: [B, C, Ns]
-    return: [B, C, Nt]
-    """
-    b, _, nt = target_pos.shape
-    _, c, ns = source_feat.shape
-    with torch.no_grad():
-        dist = torch.cdist(target_pos.transpose(1, 2).contiguous(),
-                           source_pos.transpose(1, 2).contiguous(), p=2)  # [B, Nt, Ns]
-        idx = dist.argmin(dim=-1)  # [B, Nt]
-    idx_expand = idx.unsqueeze(1).expand(b, c, nt)  # [B, C, Nt]
-    out = torch.gather(source_feat, dim=2, index=idx_expand)
+    batch_idx = torch.arange(B, device=device).view(B, 1).expand(B, Nt)
+    out = source_feat[batch_idx, :, nn_idx]  # [B, C, Nt]
     return out
 
 
 # ============================================================
-# 语义引导门控（SGF 的门控单元）
+# 语义引导门控
 # ============================================================
 class SemanticGuidedGate(nn.Module):
     """
-    用粗尺度语义先验（logits 或 prob）对上采样分支进行空间门控。
-    典型用法：
-        # 128 尺度得到的 logits: sem128_logits [B, K, 128]
-        # 需要对 512 尺度的上采样特征进行门控：
-        gate_512 = sg_gate(sem_logits=sem128_logits,
-                           source_pos=xyz_128, target_pos=xyz_512)  # [B, 1, 512]
-        up128_to_512 = up128_to_512 * gate_512
+    从语义 logits（来自粗尺度）产生门控权重，插值到目标尺度。
+    sem_logits: [B, K, Ns] （channel-first）
+    返回: [B, 1, Nt] 的门控系数（Sigmoid）
     """
-    def __init__(self, num_classes: int):
+    def __init__(self, num_classes: int, temperature: float = 1.0, use_max_class=True):
         super().__init__()
-        self.conv = nn.Conv1d(num_classes, 1, kernel_size=1, bias=True)
-        nn.init.kaiming_normal_(self.conv.weight, mode="fan_out", nonlinearity="relu")
-        if self.conv.bias is not None:
-            nn.init.zeros_(self.conv.bias)
-        self.gate = nn.Sigmoid()
+        self.num_classes = num_classes
+        self.temperature = temperature
+        self.use_max_class = use_max_class
+        self.proj = nn.Conv1d(num_classes, 1, kernel_size=1, bias=True)
 
-    @torch.no_grad()
-    def _to_prob(self, sem_logits: torch.Tensor) -> torch.Tensor:
-        return F.softmax(sem_logits, dim=1)
-
-    def forward(self,
-                sem_logits: torch.Tensor,
-                source_pos: torch.Tensor,
-                target_pos: torch.Tensor) -> torch.Tensor:
-        """
-        sem_logits: [B, K, Ms]   （粗尺度）
-        source_pos: [B, 3, Ms]
-        target_pos: [B, 3, Nt]
-        return: gate [B, 1, Nt]
-        """
-        prob = self._to_prob(sem_logits)                 # [B, K, Ms]
-        prob_up = nearest_interpolate(target_pos, source_pos, prob)  # [B, K, Nt]
-        gate = self.gate(self.conv(prob_up))             # [B, 1, Nt]
+    def forward(self, sem_logits: torch.Tensor, source_pos: torch.Tensor, target_pos: torch.Tensor) -> torch.Tensor:
+        # sem_logits: [B, K, Ns]  （注意：不是 [B,N,K]）
+        x = sem_logits / max(1e-6, self.temperature)
+        if self.use_max_class:
+            # 使用每点最大类的 logit 作为显著性
+            x_max = x.max(dim=1, keepdim=True)[0]   # [B,1,Ns]
+            src_feat = x_max
+        else:
+            # 学习到 1 channel
+            src_feat = self.proj(x)                 # [B,1,Ns]
+        gate = nearest_interpolate(target_pos, source_pos, src_feat)   # [B,1,Nt]
+        gate = torch.sigmoid(gate)
         return gate
+
+
+# ============================================================
+# 通道相关注意力（CCC，轻量版）
+# ============================================================
+class ChannelCCC(nn.Module):
+    """
+    基于通道相关性的注意力（CCC），在通道维上构建相似度并做自适应重标定。
+    输入/输出: [B, C, N]
+    """
+    def __init__(self, channels: int, reduction: int = 8, dropout: float = 0.0):
+        super().__init__()
+        hidden = max(4, channels // reduction)
+        self.theta = nn.Conv1d(channels, hidden, kernel_size=1, bias=False)
+        self.phi   = nn.Conv1d(channels, hidden, kernel_size=1, bias=False)
+        self.g     = nn.Conv1d(channels, channels, kernel_size=1, bias=False)
+
+        self.act = nn.ReLU(inplace=True)
+        self.drop = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
+        self.scale = 1.0 / math.sqrt(max(1, hidden))
+
+        self.apply(init_conv1x1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, N]
+        B, C, N = x.shape
+        theta = self.theta(x)  # [B, H, N]
+        phi   = self.phi(x)    # [B, H, N]
+        g     = self.g(x)      # [B, C, N]
+
+        # 通道相似度：对 N 做 mean 聚合后在通道上做相关性
+        theta_mean = theta.mean(dim=-1)  # [B, H]
+        phi_mean   = phi.mean(dim=-1)    # [B, H]
+        sim = (theta_mean * phi_mean).sum(dim=-1, keepdim=True) * self.scale  # [B, 1]
+        sim = sim.view(B, 1, 1).expand(B, C, N)
+
+        out = x + self.drop(self.act(g)) * sim
+        return out

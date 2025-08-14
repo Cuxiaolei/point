@@ -502,127 +502,102 @@ class SGDAT(nn.Module):
 
         return logits
 
-        # ===== 新增：用类别先验初始化分类器偏置（主头 + 辅助头） =====
-        @torch.no_grad()
-        def set_class_priors(self, priors):
-            """
-            priors: 形如 (K,) 的概率分布（counts / sum(counts)）
-            用 logit(p) 初始化分类器 bias，可显著缓解极度不均衡时“只出多数类”的冷启动问题
-            """
-            eps = 1e-6
-            p = torch.as_tensor(priors, dtype=torch.float32, device=next(self.parameters()).device)
-            p = torch.clamp(p, min=eps, max=1 - eps)
-            logit_bias = torch.log(p) - torch.log(1 - p)  # log(p/(1-p))
+    # ---------- 训练便捷接口 ----------
+    def get_loss(
+            self,
+            points,
+            labels,
+            class_weights=None,
+            ignore_index=-1,
+            aux_weight=None,
+            reduction='mean',
+            label_smoothing: float = 0.0,
+            focal_gamma: float = 0.0,
+            **kwargs
+    ):
+        logits = self.forward(points)  # (B,N,K)
 
-            # 主头
-            if hasattr(self, "head") and hasattr(self.head, "bias") and self.head.bias is not None:
-                self.head.bias.copy_(logit_bias)
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            print("[NaN Debug] NaN/Inf detected in logits, fixing...")
+            logits = torch.nan_to_num(logits)
 
-            # 辅助头（如果存在）
-            if hasattr(self, "sem128_head") and hasattr(self.sem128_head, "bias") and self.sem128_head.bias is not None:
-                self.sem128_head.bias.copy_(logit_bias)
+        B, N, K = logits.shape
+        labels = labels.view(B, N)
+        valid_mask = labels != ignore_index
 
-        # ===== 重写：样本级加权 + 可选 label smoothing + 可选 focal（忽略 -1） =====
-        def get_loss(
-                self,
-                points,
-                labels,
-                class_weights=None,
-                ignore_index=-1,
-                aux_weight=None,
-                reduction='mean',
-                label_smoothing: float = 0.0,
-                focal_gamma: float = 0.0,
-                **kwargs
-        ):
-            logits = self.forward(points)  # (B,N,K)
-
-            # --- NaN/Inf 防护（保留你原来的策略） ---
-            if torch.isnan(logits).any() or torch.isinf(logits).any():
-                print("[NaN Debug] NaN/Inf detected in logits, fixing.")
-                logits = torch.nan_to_num(logits)
-
-            B, N, K = logits.shape
-            labels = labels.view(B, N)
-            valid = (labels != ignore_index)
-
-            if valid.sum() == 0:
-                loss = logits.new_tensor(0.0, requires_grad=True)
-                stats = {"loss": float(loss.item()), "acc": 0.0, "valid_points": 0}
-                return loss, logits, stats
-
-            x = logits[valid]  # (M,K)
-            y = labels[valid].long()  # (M,)
-
-            # ---- 计算 log_probs / probs ----
-            log_probs = F.log_softmax(x, dim=-1)
-            probs = log_probs.exp()
-
-            # ---- label smoothing 的目标分布（样本级 one-hot -> 平滑）----
-            if label_smoothing and label_smoothing > 0.0:
-                eps = float(label_smoothing)
-                true_dist = torch.full_like(log_probs, eps / (K - 1))
-                true_dist.scatter_(1, y.unsqueeze(1), 1.0 - eps)
-            else:
-                true_dist = torch.zeros_like(log_probs)
-                true_dist.scatter_(1, y.unsqueeze(1), 1.0)
-
-            # ---- 样本级类别权重：w_i = weight[y_i]（若未提供则为 1）----
-            if class_weights is not None:
-                if not torch.is_tensor(class_weights):
-                    class_weights = torch.tensor(class_weights, dtype=x.dtype, device=x.device)
-                w_sample = class_weights[y]  # (M,)
-            else:
-                w_sample = torch.ones_like(y, dtype=x.dtype)
-
-            # ---- 基础 CE（逐样本、未聚合）----
-            ce_per = -(true_dist * log_probs).sum(dim=-1)  # (M,)
-
-            # ---- 可选 Focal（逐样本）----
-            if focal_gamma and float(focal_gamma) > 0.0:
-                pt = probs.gather(1, y.unsqueeze(1)).squeeze(1)  # (M,)
-                focal_w = (1.0 - pt).clamp(min=0.0) ** float(focal_gamma)
-                ce_per = ce_per * focal_w
-
-            # ---- 应用样本权重并聚合 ----
-            ce_per = ce_per * w_sample
-            if reduction == 'sum':
-                ce = ce_per.sum()
-            else:
-                ce = ce_per.mean()  # 默认 mean
-
-            # ---- 可选辅助头损失（若存在）----
-            total_loss = ce
-            if aux_weight is None:
-                aux_weight = 0.4
-            if aux_weight > 0 and hasattr(self, "sem128_head"):
-                # 取你网络中间特征（约定 forward 里已经缓存或可再次前向取回）
-                # 为避免破坏结构，这里直接用 logits 的梯度路径，简化为对 x 的线性映射：
-                # 如果你原本实现里有明确的 sem128 logits，请替换为该张量。
-                try:
-                    aux_logits = self.sem128_head(self.cached_fuse128.permute(0, 2, 1)).permute(0, 2, 1)  # (B,N,K)
-                    aux_x = aux_logits[valid]
-                    aux_log_probs = F.log_softmax(aux_x, dim=-1)
-                    if label_smoothing and label_smoothing > 0.0:
-                        aux_ce_per = -(true_dist * aux_log_probs).sum(dim=-1)
-                    else:
-                        aux_ce_per = F.nll_loss(aux_log_probs, y, reduction='none')
-                    if class_weights is not None:
-                        aux_ce_per = aux_ce_per * w_sample
-                    aux_loss = aux_ce_per.mean()
-                    total_loss = total_loss + aux_weight * aux_loss
-                except Exception:
-                    # 如果没有 cached_fuse128 或辅助头不可用，则跳过
-                    pass
-
-            # ---- 训练时的简易准确率（仅统计有效样本）----
+        if valid_mask.sum() == 0:
+            loss = logits.new_tensor(0.0, requires_grad=True)
             with torch.no_grad():
-                preds = x.argmax(dim=-1)
-                acc = (preds == y).float().mean()
+                acc = logits.new_tensor(0.0)
+            stats = {"loss": float(loss.item()), "acc": float(acc.item()), "valid_points": 0}
+            return loss, logits, stats
 
-            stats = {
-                "loss": float(total_loss.detach().item()),
-                "acc": float(acc.item()),
-                "valid_points": int(valid.sum().item())
-            }
-            return total_loss, logits, stats
+        logits_valid = logits[valid_mask]
+        labels_valid = labels[valid_mask]
+
+        if torch.isnan(logits_valid).any() or torch.isinf(logits_valid).any():
+            print("[NaN Debug] NaN/Inf detected in logits_valid, fixing...")
+            logits_valid = torch.nan_to_num(logits_valid)
+        if torch.isnan(labels_valid).any() or torch.isinf(labels_valid).any():
+            print("[NaN Debug] NaN/Inf detected in labels_valid, fixing...")
+            labels_valid = torch.nan_to_num(labels_valid)
+
+        if class_weights is not None:
+            weight = logits_valid.new_tensor(class_weights)
+        else:
+            weight = None
+
+        if label_smoothing and label_smoothing > 0.0:
+            eps = float(label_smoothing)
+            probs = F.softmax(logits_valid, dim=-1)
+            log_probs = F.log_softmax(logits_valid, dim=-1)
+            n_class = logits_valid.shape[-1]
+            true_dist = torch.full_like(log_probs, eps / (n_class - 1), dtype=log_probs.dtype)
+            true_dist.scatter_(1, labels_valid.unsqueeze(1), 1.0 - eps)
+        else:
+            probs = F.softmax(logits_valid, dim=-1)
+            log_probs = F.log_softmax(logits_valid, dim=-1)
+
+            n_class = logits_valid.shape[-1]
+            true_dist = torch.zeros_like(log_probs)
+            true_dist.scatter_(1, labels_valid.unsqueeze(1), 1.0)
+
+        ce = -(true_dist * log_probs).sum(dim=-1)
+
+        if weight is not None:
+            w = weight[labels_valid]
+            ce = ce * w
+
+        if focal_gamma is not None and focal_gamma > 0.0:
+            gamma = float(focal_gamma)
+            pt = (true_dist * probs).sum(dim=-1).clamp(min=1e-6, max=1.0)
+            if torch.isnan(pt).any() or torch.isinf(pt).any():
+                print("[NaN Debug] NaN/Inf detected in pt, fixing...")
+                pt = torch.nan_to_num(pt)
+            focal_weight = (1.0 - pt) ** gamma
+            ce = focal_weight * ce
+
+        if reduction == 'mean':
+            loss_main = ce.mean()
+        elif reduction == 'sum':
+            loss_main = ce.sum()
+        else:
+            loss_main = ce
+
+        loss = loss_main if aux_weight is None else loss_main * (1 - aux_weight)
+
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            print("[NaN Debug] NaN/Inf detected in final loss, fixing...")
+            loss = torch.nan_to_num(loss)
+
+        with torch.no_grad():
+            pred = logits_valid.argmax(dim=-1)
+            correct = (pred == labels_valid).sum()
+            acc = correct.float() / labels_valid.numel()
+
+        stats = {
+            "loss": float(loss.detach().item()),
+            "acc": float(acc.detach().item()),
+            "valid_points": int(valid_mask.sum().item())
+        }
+        return loss, logits, stats
