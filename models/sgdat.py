@@ -413,11 +413,11 @@ class SGDAT(nn.Module):
         xyz_128, feat_512_128, idx_128 = self._sample_and_gather(xyz_512, feat_512, npoint=128)
         enc_128_in = torch.cat([xyz_128, feat_512_128], dim=-1)
         feat_128 = self.enc128(enc_128_in)
-        self._check_nan("enc128_out", feat_128)
+        self._check_nan(feat_128, "enc128_out")
 
         if self.use_dynamic_fusion and self.dyn128 is not None:
             feat_128 = feat_128 + self._apply_channel_first_module_with_pos(feat_128, xyz_128, self.dyn128)
-        self._check_nan("dyn128_out", feat_128)
+        self._check_nan(feat_128, "dyn128_out")
 
         feat_128 = self._apply_channel_first_module(feat_128, self.ccc_128)
 
