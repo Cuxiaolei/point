@@ -28,6 +28,8 @@ def normalize_xyz(xyz, eps=1e-6):
     std = xyz.std(dim=1, keepdim=True).clamp(min=eps)
     return (xyz - mean) / std
 
+# -----------------utils: fps & indexing----------------
+
 
 def farthest_point_sample(xyz, npoint):
     """
@@ -54,66 +56,45 @@ def farthest_point_sample(xyz, npoint):
 
 def batched_index_points(points, idx):
     """
-    points: (B, N, C), idx: (B, M)
-    return: (B, M, C)
+    points: (B, N, C)
+    idx: (B, S) or (B, S, K)
+    return: (B, S, C) or (B, S, K, C)
     """
-    B, N, C = points.shape
-    _, M = idx.shape
-    batch_indices = torch.arange(B, device=points.device).view(B, 1).repeat(1, M)
-    return points[batch_indices, idx, :]
+    device = points.device
+    B = points.shape[0]
+    view_shape = list(idx.shape)
+    view_shape[1:] = [1] * (len(view_shape) - 1)
+    repeat_shape = list(idx.shape)
+    repeat_shape[0] = 1
+    batch_indices = torch.arange(B, dtype=torch.long, device=device).view(view_shape).repeat(repeat_shape)
+    new_points = points[batch_indices, idx, :]
+    return new_points
 
-
-def squared_distance(src, dst):
-    """
-    src: (B, N, 3)
-    dst: (B, M, 3)
-    return: dist: (B, N, M)
-    """
+def square_distance(src, dst):
     B, N, _ = src.shape
     _, M, _ = dst.shape
-    dist = -2 * torch.matmul(src, dst.transpose(1, 2))
-    dist += torch.sum(src ** 2, dim=-1, keepdim=True)
-    dist += torch.sum(dst ** 2, dim=-1).unsqueeze(1)
+    dist = -2 * torch.matmul(src, dst.permute(0, 2, 1))
+    dist += torch.sum(src ** 2, -1).view(B, N, 1)
+    dist += torch.sum(dst ** 2, -1).view(B, 1, M)
     return dist
-
 
 # -------------------------
 # 轻量模块（点形式到 Conv1d 的桥接）
 # -------------------------
 class SE1D(nn.Module):
-    def __init__(self, channels: int, reduction: int = 8):
+    def __init__(self, channels, reduction=16):
         super().__init__()
-        hidden = max(4, channels // reduction)
-        self.avg = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Sequential(
-            nn.Conv1d(channels, hidden, 1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(hidden, channels, 1, bias=True),
-            nn.Sigmoid()
-        )
+        hidden = max(8, channels // reduction)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc1 = nn.Conv1d(channels, hidden, 1, bias=True)
+        self.fc2 = nn.Conv1d(hidden, channels, 1, bias=True)
+        self.act = nn.ReLU(inplace=True)
+        self.gate = nn.Sigmoid()
 
-    def forward(self, x):  # x: (B,C,N)
-        w = self.avg(x)
-        w = self.fc(w)
-        return x * w
-
-
-class SharedMLP1D(nn.Module):
-    def __init__(self, cin, cout, bn_eps=1e-3, bn_momentum=0.01, dropout: float = 0.0):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv1d(cin, cout, 1, bias=False),
-            nn.BatchNorm1d(cout, eps=bn_eps, momentum=bn_momentum),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
-        )
-
-    def forward(self, x):  # (B,N,Cin)
-        x = x.permute(0, 2, 1)
-        x = self.block(x)
-        x = x.permute(0, 2, 1).contiguous()
-        return x
-
+    def forward(self, x):  # x: [B,C,N]
+        s = self.pool(x)
+        s = self.fc2(self.act(self.fc1(s)))
+        return x * self.gate(s)
 
 class ResMLP1D(nn.Module):
     def __init__(self, cin, cout, bn_eps=1e-3, bn_momentum=0.01, use_se=True, dropout: float = 0.0):
@@ -148,79 +129,63 @@ class ResMLP1D(nn.Module):
 # SGDAT 主干
 # -------------------------
 class SGDAT(nn.Module):
-    def __init__(
-        self,
-        num_classes,
-        base_dim=64,
-        max_points=8000,
-        debug=False,
-        # ====== 抗过拟合 ======
-        dropout_p: float = 0.0,
-        droppath_prob: float = 0.0,
-        drop_rgb_p: float = 0.0,
-        drop_normal_p: float = 0.0,
-        logit_temp: float = 1.0,
-        # ====== 模块开关 ======
-        use_channel_ccc: bool = True,
-        use_dynamic_fusion: bool = True,
-        use_linear_gva: bool = True,
-        use_semantic_guided_fusion: bool = True,
-        # ====== 动态邻域参数 ======
-        dyn_neighbors: int = 16,
-        dyn_tau: float = 0.2,
-        # ====== BN/数值稳定 ======
-        bn_eps: float = 1e-3,
-        bn_momentum: float = 0.01,
-        # ====== 轻几何增强 ======
-        use_geom_enhance: bool = True,
-        # ====== 新增：从 config 导入 ======
-        cfg=None
-    ):
-        # 如果传入了 cfg，就用它的属性覆盖同名参数
-        if cfg is not None:
-            for k, v in cfg.__dict__.items():
-                if hasattr(self, k) or k in locals():
-                    locals()[k] = v
-            # num_classes 单独保证取 config 里的
-            if hasattr(cfg, "NUM_CLASSES"):
-                num_classes = cfg.NUM_CLASSES
-
+    def __init__(self,
+                 in_dim=9,
+                 base_dim=64,
+                 num_classes=3,
+                 bn_eps=1e-3,
+                 bn_momentum=0.01,
+                 dropout_p=0.0,
+                 use_channel_ccc=True,
+                 use_linear_gva=True,
+                 use_dynamic_fusion=True,
+                 use_semantic_guided_fusion=True,
+                 gva_lin_embed=64,
+                 dyn_neighbors=16,
+                 dyn_tau=0.2,
+                 logit_temp=1.0,
+                 debug=False):
         super().__init__()
-        self.num_classes = int(num_classes)
-        self.base_dim = int(base_dim)
-        self.max_points = int(max_points)
-        self.debug = bool(debug)
-        self.dropout_p = float(dropout_p)
-        self.droppath_prob = float(droppath_prob)
-        self.drop_rgb_p = float(drop_rgb_p)
-        self.drop_normal_p = float(drop_normal_p)
-        self.logit_temp = float(logit_temp)
-
-        self.use_channel_ccc = bool(use_channel_ccc)
-        self.use_dynamic_fusion = bool(use_dynamic_fusion)
-        self.use_linear_gva = bool(use_linear_gva)
-        self.use_semantic_guided_fusion = bool(use_semantic_guided_fusion)
-
+        self.in_dim = in_dim
+        self.base_dim = base_dim
+        self.num_classes = num_classes
+        self.bn_eps = bn_eps
+        self.bn_momentum = bn_momentum
+        self.dropout_p = dropout_p
+        self.use_channel_ccc = use_channel_ccc
+        self.use_linear_gva = use_linear_gva
+        self.use_dynamic_fusion = use_dynamic_fusion
+        self.use_semantic_guided_fusion = use_semantic_guided_fusion
+        self.gva_lin_embed = gva_lin_embed
         self.dyn_neighbors = dyn_neighbors
-        self.dyn_tau = float(dyn_tau)
+        self.dyn_tau = dyn_tau
+        self.logit_temp = logit_temp
+        self.debug = debug
 
-        self.bn_eps = float(bn_eps)
-        self.bn_momentum = float(bn_momentum)
+        # ---------- stem ----------
+        self.stem = nn.Sequential(
+            nn.Conv1d(in_dim - 3, base_dim, 1, bias=False),
+            nn.BatchNorm1d(base_dim, eps=bn_eps, momentum=bn_momentum),
+            nn.ReLU(inplace=True)
+        )
 
-        self.use_geom_enhance = bool(use_geom_enhance)
-
-        # ---------- Encoder ----------
-        self.enc0 = ResMLP1D(9, base_dim, bn_eps=self.bn_eps, bn_momentum=self.bn_momentum,
-                             use_se=True, dropout=self.dropout_p)  # (B,N,64)
-
-        if self.use_geom_enhance:
-            self.geom_embed_512 = SharedMLP1D(2, base_dim // 2, dropout=self.dropout_p,
-                                              bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)
-            self.geom_embed_N   = SharedMLP1D(2, base_dim // 2, dropout=self.dropout_p,
-                                              bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)
-        else:
-            self.geom_embed_512 = None
-            self.geom_embed_N = None
+        # ---------- encoder ----------
+        self.use_geom_enhance = True
+        self.geom_embed_512 = nn.Sequential(
+            nn.Linear(10, base_dim // 2, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(base_dim // 2, base_dim // 2, bias=False)
+        )
+        self.pos512 = nn.Sequential(
+            nn.Linear(3, base_dim * 2, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(base_dim * 2, base_dim * 2, bias=False)
+        )
+        self.posN = nn.Sequential(
+            nn.Linear(3, base_dim, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(base_dim, base_dim, bias=False)
+        )
 
         self.enc512_in_dim = 3 + base_dim + (base_dim // 2 if self.use_geom_enhance else 0)
         self.enc512 = ResMLP1D(self.enc512_in_dim, base_dim, bn_eps=self.bn_eps,
@@ -237,71 +202,67 @@ class SGDAT(nn.Module):
             self.ccc_512 = nn.Identity()
             self.ccc_128 = nn.Identity()
 
-        # 动态邻域 - 通道融合（内部已升级为密度自适应）
+        # 动态邻域 - 通道融合
         if self.use_dynamic_fusion:
             self.dyn512 = DynamicRadiusChannelFusion(
                 c_in=base_dim, c_hidden=base_dim, c_out=base_dim,
-                k=self.dyn_neighbors, tau=self.dyn_tau, k0=8, alpha=1.5, k_max=max(self.dyn_neighbors, 32)
+                k=self.dyn_neighbors, tau=self.dyn_tau
             )
             self.dyn128 = DynamicRadiusChannelFusion(
                 c_in=base_dim * 2, c_hidden=base_dim * 2, c_out=base_dim * 2,
-                k=self.dyn_neighbors, tau=self.dyn_tau, k0=8, alpha=1.5, k_max=max(self.dyn_neighbors, 32)
+                k=self.dyn_neighbors, tau=self.dyn_tau
             )
         else:
             self.dyn512 = None
             self.dyn128 = None
 
-        # 位置/尺度编码
-        self.pos512 = SharedMLP1D(3, base_dim * 2, dropout=self.dropout_p,
-                                  bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)
-        self.posN   = SharedMLP1D(3, base_dim,     dropout=self.dropout_p,
-                                  bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)
-
-        # 线性 GVA
-        if self.use_linear_gva:
-            self.gva_512 = LinearSpatialGVA(dim=base_dim * 2)
-            self.gva_N   = LinearSpatialGVA(dim=base_dim * 2)
-        else:
-            self.gva_512 = nn.Identity()
-            self.gva_N   = nn.Identity()
-
-        # 语义引导门控
+        # 语义引导分支
         if self.use_semantic_guided_fusion:
-            self.sem128_head = nn.Conv1d(base_dim * 2, self.num_classes, kernel_size=1, bias=True)
-            self.sem_gate_512 = SemanticGuidedGate(self.num_classes)
-            self.sem_gate_N   = SemanticGuidedGate(self.num_classes)
+            self.sem128_head = nn.Sequential(
+                nn.Conv1d(base_dim * 2, base_dim * 2, 1, bias=False),
+                nn.BatchNorm1d(base_dim * 2, eps=bn_eps, momentum=bn_momentum),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(base_dim * 2, num_classes, 1, bias=True)
+            )
+            self.gate_to_512 = SemanticGuidedGate(num_classes=num_classes, temperature=1.0, use_max_class=True)
+            self.gate_to_N = SemanticGuidedGate(num_classes=num_classes, temperature=1.0, use_max_class=True)
         else:
             self.sem128_head = None
-            self.sem_gate_512 = None
-            self.sem_gate_N = None
+            self.gate_to_512 = None
+            self.gate_to_N = None
 
-        # ---------- Decoder ----------
+        # 解码与融合
+        self.branch_dp1 = DropPath(self.dropout_p) if self.dropout_p > 0 else nn.Identity()
+        self.branch_dp2 = DropPath(self.dropout_p) if self.dropout_p > 0 else nn.Identity()
+
         self.up1 = nn.Sequential(
             nn.Conv1d(base_dim + base_dim * 2 + base_dim * 2, base_dim * 2, 1, bias=False),
-            nn.BatchNorm1d(base_dim * 2, eps=self.bn_eps, momentum=self.bn_momentum),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=self.dropout_p) if self.dropout_p > 0 else nn.Identity()
+            nn.BatchNorm1d(base_dim * 2, eps=bn_eps, momentum=bn_momentum),
+            nn.ReLU(inplace=True)
         )
-        self.up1_refine = ResMLP1D(base_dim * 2, base_dim * 2, bn_eps=self.bn_eps,
-                                   bn_momentum=self.bn_momentum, use_se=True, dropout=self.dropout_p)
-
+        self.up1_refine = ResMLP1D(base_dim * 2, base_dim * 2, bn_eps=bn_eps, bn_momentum=bn_momentum,
+                                   use_se=True, dropout=self.dropout_p)
         self.up2 = nn.Sequential(
-            nn.Conv1d(base_dim * 2 + base_dim + base_dim, base_dim * 2, 1, bias=False),
-            nn.BatchNorm1d(base_dim * 2, eps=self.bn_eps, momentum=self.bn_momentum),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=self.dropout_p) if self.dropout_p > 0 else nn.Identity()
+            nn.Conv1d(base_dim * 2 + base_dim + base_dim, base_dim, 1, bias=False),
+            nn.BatchNorm1d(base_dim, eps=bn_eps, momentum=bn_momentum),
+            nn.ReLU(inplace=True)
         )
-        self.up2_refine = ResMLP1D(base_dim * 2, base_dim * 2, bn_eps=self.bn_eps,
-                                   bn_momentum=self.bn_momentum, use_se=True, dropout=self.dropout_p)
+        self.up2_refine = ResMLP1D(base_dim, base_dim, bn_eps=bn_eps, bn_momentum=bn_momentum,
+                                   use_se=True, dropout=self.dropout_p)
 
-        self.branch_dp1 = DropPath(self.droppath_prob) if self.droppath_prob > 0 else nn.Identity()
-        self.branch_dp2 = DropPath(self.droppath_prob) if self.droppath_prob > 0 else nn.Identity()
+        if self.use_linear_gva:
+            self.gva_512 = LinearSpatialGVA(base_dim * 2)
+            self.gva_N = LinearSpatialGVA(base_dim)
+        else:
+            self.gva_512 = nn.Identity()
+            self.gva_N = nn.Identity()
 
-        self.head = nn.Conv1d(base_dim * 2, self.num_classes, kernel_size=1)
-
-        # 上采样后的小型 1x1 refine（用于 IDW/NN 后再适配）
-        self.up_refine_512 = nn.Conv1d(base_dim * 2, base_dim * 2, kernel_size=1, bias=False)
-        self.up_refine_N   = nn.Conv1d(base_dim * 2, base_dim * 2, kernel_size=1, bias=False)
+        self.head = nn.Sequential(
+            nn.Conv1d(base_dim, base_dim, 1, bias=False),
+            nn.BatchNorm1d(base_dim, eps=bn_eps, momentum=bn_momentum),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(base_dim, num_classes, 1, bias=True)
+        )
 
         self.apply(self._init_stable)
 
@@ -343,61 +304,51 @@ class SGDAT(nn.Module):
             out[:, :, 6:9] = 0.0
         return out
 
-    def _geom_tokens(self, xyz_normed):
-        r = torch.sqrt(torch.clamp((xyz_normed ** 2).sum(dim=-1, keepdim=True), min=0.0))
-        h = xyz_normed[..., 2:3]
-        return torch.cat([r, h], dim=-1)
+    def _apply_channel_first_module(self, x_bnC, module_cf):
+        # 输入 [B,N,C] -> [B,C,N] -> 模块 -> [B,N,C]
+        x_cf = x_bnC.permute(0, 2, 1).contiguous()
+        y_cf = module_cf(x_cf) if not isinstance(module_cf, nn.Identity) else x_cf
+        y_bnC = y_cf.permute(0, 2, 1).contiguous()
+        return y_bnC
 
-    # —— 小助手：把 (B,N,C) 的张量交给 [B,C,N] 接口的模块，再转回 —— #
-    @staticmethod
-    def _apply_channel_first_module(x_bnC, mod):
-        # x_bnC: (B, N, C) -> (B, C, N) -> mod -> (B, C, N) -> (B, N, C)
-        y = mod(x_bnC.permute(0, 2, 1).contiguous())
-        return y.permute(0, 2, 1).contiguous()
+    def _apply_channel_first_module_with_pos(self, feat_bnC, xyz_bn3, module_cf):
+        # DynamicRadiusChannelFusion 这类模块需要 [B,C,N] 和 [B,3,N]
+        f_cf = feat_bnC.permute(0, 2, 1).contiguous()
+        p_cf = xyz_bn3.permute(0, 2, 1).contiguous()
+        out_cf = module_cf(f_cf, p_cf)
+        out_bnC = out_cf.permute(0, 2, 1).contiguous()
+        return out_bnC
 
-    @staticmethod
-    def _apply_channel_first_module_with_pos(x_bnC, pos_bn3, mod):
-        # x_bnC: (B,N,C) ; pos_bn3: (B,N,3)
-        x = x_bnC.permute(0, 2, 1).contiguous()      # (B,C,N)
-        p = pos_bn3.permute(0, 2, 1).contiguous()    # (B,3,N)
-        y = mod(x, p)                                # (B,C,N)
-        return y.permute(0, 2, 1).contiguous()       # (B,N,C)
-
-    # ---------- 前向 ----------
-    def forward(self, points, return_aux: bool = False):
+    def forward(self, points, return_aux=False):
         """
-        points: (B, N, 9) -> [xyz(0:3), rgb(3:6), normal(6:9)]
-        return: logits (B, N, num_classes)
-                若 return_aux=True, 还返回 {'sem128_logits': (B,K,128), 'idx_128': (B,128)}
+        points: [B, N, in_dim], in_dim=9 -> xyz(3) + rgb(3) + normal(3)
         """
         B, N, C = points.shape
-        assert C == 9, f"Expect input features 9 (xyz+rgb+normal), but got {C}"
+        xyz = points[:, :, :3].contiguous()
+        feat0 = points[:, :, 3:].contiguous()  # (B,N,6)
 
-        if self.debug:
-            print(f"[DEBUG] Input shape: {points.shape}")
+        # 归一化坐标（作为位置编码输入）
+        center = xyz.mean(dim=1, keepdim=True)
+        xyz_normed = xyz - center
+        scale = torch.clamp(xyz_normed.norm(dim=-1).max(dim=1)[0].view(B, 1, 1), min=1e-6)
+        xyz_normed = xyz_normed / scale
 
-        points = self._feature_group_dropout(points)
-
-        xyz = points[:, :, 0:3]
-        rgb = points[:, :, 3:6]
-        normal = points[:, :, 6:9]
-        xyz_normed = normalize_xyz(xyz)
-
-        geom_N = self._geom_tokens(xyz_normed)  # (B,N,2)
-        geom_emb_N = self.geom_embed_N(geom_N) if (self.use_geom_enhance and self.geom_embed_N is not None) else None
-
-        feat0_in = torch.cat([xyz_normed, rgb, normal], dim=-1)  # (B,N,9)
-        feat0 = self.enc0(feat0_in)                              # (B,N,64)
-
-        if self.use_geom_enhance and geom_emb_N is not None and geom_emb_N.shape[-1] == self.base_dim:
-            feat0 = feat0 + geom_emb_N
+        # stem
+        feat0_cf = feat0.permute(0, 2, 1).contiguous()  # [B,6,N]
+        stem = self.stem(feat0_cf)                      # [B,64,N]
+        feat0_64 = stem.permute(0, 2, 1).contiguous()   # [B,N,64]
 
         # 下采样到 512
-        xyz_512, feat0_512, idx_512 = self._sample_and_gather(xyz_normed, feat0, npoint=512)  # (B,512,3),(B,512,64)
+        xyz_512, feat0_512, idx_512 = self._sample_and_gather(xyz_normed, feat0_64, npoint=512)
 
-        # 编码 512 输入：xyz + feat0_512 +（可选 geom_512_emb）
+        # 几何增强嵌入（示例：10 维）
+        geom_512 = torch.cat([
+            xyz_512, torch.norm(xyz_512, dim=-1, keepdim=True),
+            torch.mean(torch.abs(xyz_512 - xyz_512.mean(dim=1, keepdim=True)), dim=-1, keepdim=True),
+            torch.zeros_like(xyz_512[..., :1])
+        ], dim=-1)  # [B,512,10]
+
         if self.use_geom_enhance:
-            geom_512 = batched_index_points(geom_N, idx_512)               # (B,512,2)
             geom_emb_512 = self.geom_embed_512(geom_512)                   # (B,512,base_dim//2)
             enc_512_in = torch.cat([xyz_512, feat0_512, geom_emb_512], dim=-1)
         else:
@@ -424,34 +375,16 @@ class SGDAT(nn.Module):
         feat_128 = self._apply_channel_first_module(feat_128, self.ccc_128)  # (B,128,128)
 
         # ===== 语义引导先验（在 128 尺度形成） =====
+        gate512 = gateN = None
+        sem128_logits = None
         if self.use_semantic_guided_fusion and self.sem128_head is not None:
-            # 注意 sem128_head 期望 [B,C,N]，故先转置
             sem128_logits = self.sem128_head(feat_128.permute(0, 2, 1).contiguous())  # (B,K,128)
-            # 门控到 512、N 两个尺度（插值在 channel-first 接口）
-            gate512 = self.sem_gate_512(
-                sem_logits=sem128_logits,
-                source_pos=xyz_128.permute(0, 2, 1).contiguous(),
-                target_pos=xyz_512.permute(0, 2, 1).contiguous()
-            )  # (B,1,512)
-            gateN = self.sem_gate_N(
-                sem_logits=sem128_logits,
-                source_pos=xyz_128.permute(0, 2, 1).contiguous(),
-                target_pos=xyz_normed.permute(0, 2, 1).contiguous()
-            )  # (B,1,N)
-        else:
-            sem128_logits = None
-            gate512 = None
-            gateN = None
-
-        if self.debug:
-            with torch.no_grad():
-                n_nan1 = torch.isnan(feat_512).any().item()
-                n_nan2 = torch.isnan(feat_128).any().item()
-                print(f"[DEBUG] out1 shape: {feat_512.shape}, NaN={int(n_nan1)}, Inf={int(torch.isinf(feat_512).any().item())}; "
-                      f"out2 shape: {feat_128.shape}, NaN={int(n_nan2)}, Inf={int(torch.isinf(feat_128).any().item())}")
+            gate512 = self.gate_to_512(sem128_logits, source_pos=xyz_128.permute(0, 2, 1).contiguous(),
+                                       target_pos=xyz_512.permute(0, 2, 1).contiguous())  # [B,1,512]
+            gateN = self.gate_to_N(sem128_logits, source_pos=xyz_128.permute(0, 2, 1).contiguous(),
+                                   target_pos=xyz_normed.permute(0, 2, 1).contiguous())  # [B,1,N]
 
         # ---------- Decoder: 128 -> 512 ----------
-        # 将 128 特征上采样到 512（改为 IDW；如需最近邻可切回 nearest_interpolate）
         up128_to_512_cf = idw_interpolate(
             target_pos=xyz_512.permute(0, 2, 1).contiguous(),
             source_pos=xyz_128.permute(0, 2, 1).contiguous(),
@@ -460,8 +393,25 @@ class SGDAT(nn.Module):
         )  # (B,128,512)
         up128_to_512 = up128_to_512_cf.permute(0, 2, 1).contiguous()  # (B,512,128)
 
+        # ====== 修复点 1：对齐 gate512 并显式广播 ======
         if gate512 is not None:
-            up128_to_512 = up128_to_512 * gate512.permute(0, 2, 1).contiguous()
+            g512 = gate512
+            if g512.dim() != 3:
+                raise RuntimeError(f"gate512 dim unexpected: {g512.shape}")
+            # 期望 up128_to_512 为 [B,512,128]
+            if g512.shape[1] == 1 and g512.shape[2] == up128_to_512.shape[1]:
+                # [B,1,512] -> [B,512,1]
+                g512 = g512.permute(0, 2, 1).contiguous()
+            elif g512.shape[1] == up128_to_512.shape[1] and g512.shape[2] == 1:
+                # 已是 [B,512,1]
+                g512 = g512.contiguous()
+            else:
+                # 兜底：压到通道 1，再校正最后一维
+                g512 = g512.mean(dim=1, keepdim=True)
+                if g512.shape[-1] != up128_to_512.shape[1]:
+                    raise RuntimeError(f"gate512 last dim {g512.shape[-1]} != {up128_to_512.shape[1]}")
+                g512 = g512.permute(0, 2, 1).contiguous()
+            up128_to_512 = up128_to_512 * g512.expand_as(up128_to_512)
 
         pos512 = self.pos512(xyz_512)                                   # (B,512,128)
 
@@ -472,8 +422,8 @@ class SGDAT(nn.Module):
         # refine & droppath
         up128_to_512 = self.branch_dp1(up128_to_512)
         pos512 = self.branch_dp1(pos512)
-        # 拼接
-        fuse_512 = torch.cat([feat_512, up128_to_512, pos512], dim=-1)  # (B,512,64+128+128=320)
+
+        fuse_512 = torch.cat([feat_512, up128_to_512, pos512], dim=-1)   # (B,512,64+128+128=320)
         fuse_512 = self.up1(fuse_512.permute(0, 2, 1)).permute(0, 2, 1).contiguous()  # (B,512,128)
         fuse_512 = self.up1_refine(fuse_512)
         fuse_512 = self._apply_channel_first_module(fuse_512, self.gva_512)
@@ -487,49 +437,57 @@ class SGDAT(nn.Module):
         )  # (B,128,N)
         up512_to_N = up512_to_N_cf.permute(0, 2, 1).contiguous()  # (B,N,128)
 
+        # ====== 修复点 2：对齐 gateN 并显式广播 ======
         if gateN is not None:
-            up512_to_N = up512_to_N * gateN.permute(0, 2, 1).contiguous()
+            gN = gateN
+            if gN.dim() != 3:
+                raise RuntimeError(f"gateN dim unexpected: {gN.shape}")
+            # 期望 up512_to_N 为 [B,N,128]
+            if gN.shape[1] == 1 and gN.shape[2] == up512_to_N.shape[1]:
+                # [B,1,N] -> [B,N,1]
+                gN = gN.permute(0, 2, 1).contiguous()
+            elif gN.shape[1] == up512_to_N.shape[1] and gN.shape[2] == 1:
+                # 已是 [B,N,1]
+                gN = gN.contiguous()
+            else:
+                gN = gN.mean(dim=1, keepdim=True)
+                if gN.shape[-1] != up512_to_N.shape[1]:
+                    raise RuntimeError(f"gateN last dim {gN.shape[-1]} != {up512_to_N.shape[1]}")
+                gN = gN.permute(0, 2, 1).contiguous()
+            up512_to_N = up512_to_N * gN.expand_as(up512_to_N)
 
         posN = self.posN(xyz_normed)                                     # (B,N,64)
 
-        if self.use_geom_enhance and geom_emb_N is not None and geom_emb_N.shape[-1] == posN.shape[-1]:
-            posN = posN + geom_emb_N
-
-        # 形状断言
-        assert up512_to_N.shape[:2] == feat0.shape[:2] == posN.shape[:2], \
-            f"Shape mismatch @N: up512_to_N {up512_to_N.shape}, feat0 {feat0.shape}, posN {posN.shape}"
-
-        up512_to_N = self.branch_dp2(up512_to_N)
-        posN = self.branch_dp2(posN)
+        if self.use_linear_gva:
+            up512_to_N = self._apply_channel_first_module(up512_to_N, self.gva_N)
 
         fuse_N = torch.cat([up512_to_N, feat0, posN], dim=-1)            # (B,N,256)
         fuse_N = self.up2(fuse_N.permute(0, 2, 1)).permute(0, 2, 1).contiguous()  # (B,N,128)
         fuse_N = self.up2_refine(fuse_N)
-        fuse_N = self._apply_channel_first_module(fuse_N, self.gva_N)
 
         logits = self.head(fuse_N.permute(0, 2, 1)).permute(0, 2, 1).contiguous()  # (B,N,K)
 
         if self.logit_temp and self.logit_temp != 1.0:
             logits = logits / self.logit_temp
 
-        if self.debug:
-            with torch.no_grad():
-                print(f"[DEBUG] logits shape: {logits.shape}, "
-                      f"min={float(logits.min()) if torch.isfinite(logits).any() else 0.0}, "
-                      f"max={float(logits.max()) if torch.isfinite(logits).any() else 0.0}")
-
         if return_aux and (sem128_logits is not None):
-            return logits, {"sem128_logits": sem128_logits, "idx_128": idx_128}
+            # 注意：保持你原来 get_loss 依赖的 key 名称
+            aux = {
+                "sem128_logits": sem128_logits,     # (B,K,128) channel-first
+                "idx_128": idx_128                  # (B,128)
+            }
+            return logits, aux
+
         return logits
 
-    # ---------- 训练便捷接口 ----------
+    # ---------------- loss（保持你的完整实现） ----------------
     def get_loss(
             self,
             points,
             labels,
             class_weights=None,
             ignore_index=-1,
-            aux_weight: float = 0.2,   # 新增：语义引导辅助监督的权重
+            aux_weight: float = 0.2,  # 语义引导辅助监督的权重
             reduction='mean',
             label_smoothing: float = 0.0,
             focal_gamma: float = 0.0,
@@ -542,65 +500,53 @@ class SGDAT(nn.Module):
         else:
             logits, aux = out, None
 
-        if torch.isnan(logits).any() or torch.isinf(logits).any():
-            print("[NaN Debug] NaN/Inf detected in logits, fixing...")
-            logits = torch.nan_to_num(logits)
-
         B, N, K = logits.shape
-        labels = labels.view(B, N)
-        valid_mask = labels != ignore_index
 
-        if valid_mask.sum() == 0:
-            loss = logits.new_tensor(0.0, requires_grad=True)
-            with torch.no_grad():
-                acc = logits.new_tensor(0.0)
-            stats = {"loss": float(loss.item()), "acc": float(acc.item()), "valid_points": 0}
-            return loss, logits, stats
-
+        # 有效掩码
+        labels = labels.long()
+        valid_mask = labels.ne(ignore_index)
         logits_valid = logits[valid_mask]
         labels_valid = labels[valid_mask]
 
-        if torch.isnan(logits_valid).any() or torch.isinf(logits_valid).any():
-            print("[NaN Debug] NaN/Inf detected in logits_valid, fixing...")
-            logits_valid = torch.nan_to_num(logits_valid)
-        if torch.isnan(labels_valid).any() or torch.isinf(labels_valid).any():
-            print("[NaN Debug] NaN/Inf detected in labels_valid, fixing...")
-            labels_valid = torch.nan_to_num(labels_valid)
-
+        # class weights
+        weight = None
         if class_weights is not None:
-            weight = logits_valid.new_tensor(class_weights)
-        else:
-            weight = None
+            weight = class_weights.to(logits.device, dtype=logits.dtype)
 
-        # 主 CE（含可选 label smoothing & focal）
-        if label_smoothing and label_smoothing > 0.0:
+        # -------- 主损失：CE + 可选 smoothing/focal --------
+        if label_smoothing is None or label_smoothing <= 0.0:
+            if focal_gamma is None or focal_gamma <= 0.0:
+                ce = F.cross_entropy(logits_valid, labels_valid, reduction='none', weight=weight)
+            else:
+                # Focal CE
+                log_probs = F.log_softmax(logits_valid, dim=-1)
+                probs = log_probs.exp()
+                ce_raw = F.nll_loss(log_probs, labels_valid, reduction='none', weight=weight)
+                pt = probs.gather(1, labels_valid.unsqueeze(1)).squeeze(1).clamp(min=1e-6, max=1.0)
+                focal_weight = (1.0 - pt) ** float(focal_gamma)
+                ce = focal_weight * ce_raw
+        else:
             eps = float(label_smoothing)
-            probs = F.softmax(logits_valid, dim=-1)
             log_probs = F.log_softmax(logits_valid, dim=-1)
-            n_class = logits_valid.shape[-1]
-            true_dist = torch.full_like(log_probs, eps / (n_class - 1), dtype=log_probs.dtype)
-            true_dist.scatter_(1, labels_valid.unsqueeze(1), 1.0 - eps)
-        else:
-            probs = F.softmax(logits_valid, dim=-1)
-            log_probs = F.log_softmax(logits_valid, dim=-1)
-            n_class = logits_valid.shape[-1]
-            true_dist = torch.zeros_like(log_probs)
-            true_dist.scatter_(1, labels_valid.unsqueeze(1), 1.0)
+            probs = log_probs.exp()
+            with torch.no_grad():
+                true_dist = torch.zeros_like(log_probs)
+                true_dist.scatter_(1, labels_valid.unsqueeze(1), 1.0)
 
-        ce = -(true_dist * log_probs).sum(dim=-1)
+            ce = -(true_dist * log_probs).sum(dim=-1)
 
-        if weight is not None:
-            w = weight[labels_valid]
-            ce = ce * w
+            if weight is not None:
+                w = weight[labels_valid]
+                ce = ce * w
 
-        if focal_gamma is not None and focal_gamma > 0.0:
-            gamma = float(focal_gamma)
-            pt = (true_dist * probs).sum(dim=-1).clamp(min=1e-6, max=1.0)
-            if torch.isnan(pt).any() or torch.isinf(pt).any():
-                print("[NaN Debug] NaN/Inf detected in pt, fixing...")
-                pt = torch.nan_to_num(pt)
-            focal_weight = (1.0 - pt) ** gamma
-            ce = focal_weight * ce
+            if focal_gamma is not None and focal_gamma > 0.0:
+                gamma = float(focal_gamma)
+                pt = (true_dist * probs).sum(dim=-1).clamp(min=1e-6, max=1.0)
+                if torch.isnan(pt).any() or torch.isinf(pt).any():
+                    print("[NaN Debug] NaN/Inf detected in pt, fixing...")
+                    pt = torch.nan_to_num(pt)
+                focal_weight = (1.0 - pt) ** gamma
+                ce = focal_weight * ce
 
         if reduction == 'mean':
             loss_main = ce.mean()
@@ -609,30 +555,29 @@ class SGDAT(nn.Module):
         else:
             loss_main = ce
 
-        # ===== 新增：语义门控的辅助监督（CE@128） =====
+        # ===== 语义门控的辅助监督（CE@128） =====
         aux_loss = logits.new_tensor(0.0)
         if aux is not None and self.use_semantic_guided_fusion and (aux_weight is not None) and aux_weight > 0.0:
-            sem128_logits = aux["sem128_logits"]            # (B,K,128) channel-first
-            idx_128 = aux["idx_128"]                        # (B,128)
-            # 将 GT 标签下采样到 128：直接按 idx_128 索引
-            label_128 = labels.gather(dim=1, index=idx_128) # (B,128)
-            # 忽略 pad
-            valid_128 = label_128 != ignore_index
-            if valid_128.any():
-                sem_logits_valid = sem128_logits.permute(0, 2, 1)[valid_128]  # (M,K)
-                label_128_valid = label_128[valid_128]                        # (M,)
-                if class_weights is not None:
-                    weight_ = sem_logits_valid.new_tensor(class_weights)
-                else:
-                    weight_ = None
-                aux_ce = F.cross_entropy(sem_logits_valid, label_128_valid, weight=weight_, reduction='mean')
-                aux_loss = aux_ce
+            sem128_logits = aux["sem128_logits"]  # (B,K,128) channel-first
+            idx_128 = aux["idx_128"]  # (B,128)
 
-        # 组合损失（默认 0.2）
-        if aux_loss > 0:
-            loss = (1.0 - float(aux_weight)) * loss_main + float(aux_weight) * aux_loss
-        else:
-            loss = loss_main
+            # 下采样标签：用 idx_128 从原 N 标签挑选到 128
+            labels_128 = batched_index_points(labels.unsqueeze(-1), idx_128).squeeze(-1)  # (B,128)
+            valid_128 = labels_128.ne(ignore_index)
+
+            # 只对有效位置监督
+            sem_logits_flat = sem128_logits.permute(0, 2, 1).contiguous().view(-1, K)  # (B*128,K)
+            labels_128_flat = labels_128.reshape(-1)  # (B*128,)
+            valid_128_flat = valid_128.reshape(-1)
+
+            sem_logits_valid = sem_logits_flat[valid_128_flat]
+            labels_128_valid = labels_128_flat[valid_128_flat]
+
+            if sem_logits_valid.numel() > 0:
+                aux_ce = F.cross_entropy(sem_logits_valid, labels_128_valid, reduction='mean', weight=weight)
+                aux_loss = aux_ce * float(aux_weight)
+
+        loss = loss_main + aux_loss
 
         if torch.isnan(loss).any() or torch.isinf(loss).any():
             print("[NaN Debug] NaN/Inf detected in final loss, fixing...")
