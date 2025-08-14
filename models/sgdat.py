@@ -413,11 +413,11 @@ class SGDAT(nn.Module):
         xyz_128, feat_512_128, idx_128 = self._sample_and_gather(xyz_512, feat_512, npoint=128)
         enc_128_in = torch.cat([xyz_128, feat_512_128], dim=-1)
         feat_128 = self.enc128(enc_128_in)
-        self._check_nan(feat_128, "enc128_out")
+        self._check_nan("enc128_out", feat_128)
 
         if self.use_dynamic_fusion and self.dyn128 is not None:
             feat_128 = feat_128 + self._apply_channel_first_module_with_pos(feat_128, xyz_128, self.dyn128)
-        self._check_nan(feat_128, "dyn128_out")
+        self._check_nan("dyn128_out", feat_128)
 
         feat_128 = self._apply_channel_first_module(feat_128, self.ccc_128)
 
@@ -463,7 +463,7 @@ class SGDAT(nn.Module):
             k=3, p=2.0
         )
         up512_to_N = up512_to_N_cf.permute(0, 2, 1).contiguous()
-        self._check_nan("up512_to_N_before_gva", up512_to_N)
+        self._check_nan(up512_to_N, "up512_to_N_before_gva")
 
         if gateN is not None:
             gN = gateN
@@ -477,7 +477,7 @@ class SGDAT(nn.Module):
             up512_to_N = self._safe_clean(up512_to_N)
             if up512_to_N.shape[-1] != 64:
                 up512_to_N = self.reduce_to_64(up512_to_N)  # 新加的
-            self._check_nan("up512_to_N_after_clean", up512_to_N)
+            self._check_nan(up512_to_N, "up512_to_N_after_clean")
             up512_to_N = self._apply_channel_first_module(up512_to_N, self.gva_N)
 
         fuse_N = torch.cat([up512_to_N, feat0, posN], dim=-1)
