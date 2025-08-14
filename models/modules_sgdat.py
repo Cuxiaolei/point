@@ -160,7 +160,7 @@ def hybrid_fps_random(xyz: torch.Tensor, m: int, fps_ratio: float = 0.7) -> torc
 
 
 # ------------------------------------------------------------
-# 动态半径通道融合（改进版）
+# 动态半径通道融合（密度自适应版）
 # ------------------------------------------------------------
 class DynamicRadiusChannelFusion(nn.Module):
     """
@@ -168,9 +168,10 @@ class DynamicRadiusChannelFusion(nn.Module):
         x:     [B, C, N]   特征
         pos:   [B, 3, N]   坐标
     过程:
-        - KNN 邻域
-        - 距离 → 权重 softmax(-d/τ)
-        - 距离加权聚合（减少过度平滑）
+        - 用较小 k0 估计每点局部尺度 ρ_i（均距）
+        - 设半径 r_i = α·ρ_i
+        - 主聚合用较大 k_max 的 KNN，再按 r_i 对邻域进行掩码
+        - 采用 per-point 的 τ_i ∝ ρ_i 做 softmax(-d/τ_i)
         - 通道 MLP + BN + ReLU + SE + 残差
     输出:
         y:     [B, C_out, N]
@@ -184,11 +185,18 @@ class DynamicRadiusChannelFusion(nn.Module):
         tau: float = 0.2,
         reduction: int = 16,
         dropout: float = 0.0,
+        # 新增参数：
+        k0: int = 8,          # 用于估计局部尺度的近邻数
+        alpha: float = 1.5,   # 半径系数 r_i = alpha * rho_i
+        k_max: Optional[int] = None,  # 主聚合 K 上限（默认等于 k 或略大）
     ):
         super().__init__()
         c_hidden = c_hidden or c_in
         c_out = c_out or c_in
         self.k = k
+        self.k0 = k0
+        self.alpha = alpha
+        self.k_max = k_max if k_max is not None else max(k, 2 * k)  # 默认更宽的邻域上限
         self.tau = tau
 
         self.channel_proj = nn.Sequential(
@@ -199,22 +207,43 @@ class DynamicRadiusChannelFusion(nn.Module):
         self.res = Residual(c_in, c_out)
 
     def forward(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        # 规范数值
         x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
         pos = torch.nan_to_num(pos, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        b, c, n = x.shape
-        idx = knn_indices(pos, k=self.k)  # [B, N, k]
-        neigh_x = gather_neighbor(x, idx)  # [B, C, N, k]
+        B, C, N = x.shape
+        # 1) 估计局部尺度 rho_i
+        with torch.no_grad():
+            idx_k0 = knn_indices(pos, k=self.k0)                                # [B,N,k0]
+            neigh_pos_k0 = gather_neighbor(pos, idx_k0)                          # [B,3,N,k0]
+            pos_exp_k0 = pos.unsqueeze(-1).expand(B, 3, N, self.k0)
+            d_k0 = torch.norm(neigh_pos_k0 - pos_exp_k0, dim=1)                  # [B,N,k0]
+            rho = d_k0.mean(dim=-1, keepdim=True).clamp(min=1e-6)                # [B,N,1]
+            r = self.alpha * rho                                                 # [B,N,1]
+            tau_i = self.tau * (rho / (rho.mean(dim=1, keepdim=True) + 1e-6))    # [B,N,1]
 
-        pos_expand = pos.unsqueeze(-1).expand(b, 3, n, self.k)             # [B, 3, N, k]
-        neigh_pos = gather_neighbor(pos, idx)                               # [B, 3, N, k]
-        d = torch.norm(neigh_pos - pos_expand, dim=1)                       # [B, N, k]
+        # 2) 主聚合邻域：更大的 K，再按半径掩码
+        idx = knn_indices(pos, k=self.k_max)                                     # [B,N,Kmax]
+        neigh_x = gather_neighbor(x, idx)                                        # [B,C,N,Kmax]
+        neigh_pos = gather_neighbor(pos, idx)                                    # [B,3,N,Kmax]
+        pos_expand = pos.unsqueeze(-1).expand(B, 3, N, self.k_max)
+        d = torch.norm(neigh_pos - pos_expand, dim=1)                            # [B,N,Kmax]
         d = torch.clamp(d, min=1e-6)
-        w = F.softmax(-d / max(1e-6, self.tau), dim=-1).unsqueeze(1)        # [B, 1, N, k]
-        agg = torch.sum(neigh_x * w, dim=-1)                                # [B, C, N]
 
-        fuse = torch.cat([x, agg], dim=1)                                   # [B, 2C, N]
-        y = self.channel_proj(fuse)                                         # [B, C_out, N]
+        # 半径掩码：超出 r_i 的位置置为极大距离（softmax 后≈0）
+        radius = r.expand_as(d)                                                  # [B,N,Kmax]
+        masked_d = torch.where(d <= radius, d, torch.full_like(d, 1e6))
+
+        # softmax(-d / tau_i)（逐点 τ_i）
+        tau_expand = tau_i.expand_as(masked_d)
+        w = F.softmax(-masked_d / torch.clamp(tau_expand, min=1e-6), dim=-1).unsqueeze(1)  # [B,1,N,Kmax]
+
+        # 3) 加权聚合
+        agg = torch.sum(neigh_x * w, dim=-1)                                     # [B,C,N]
+
+        # 4) 通道融合 + SE + 残差
+        fuse = torch.cat([x, agg], dim=1)                                        # [B,2C,N]
+        y = self.channel_proj(fuse)                                              # [B,C_out,N]
         y = self.se(y)
         y = self.res(x, y)
         return y
@@ -332,7 +361,6 @@ class LinearMultiHeadSelfAttention1D(nn.Module):
         # 预计算项：
         # S = K^T V  -> [B, H, Dh, Dh]
         # k_sum = sum_j K_j -> [B, H, Dh]
-        # 注意：全部是 O(N * Dh^2) / O(N * Dh)
         S = torch.matmul(k_phi.transpose(-2, -1), v)            # [B, H, Dh, Dh]
         k_sum = k_phi.sum(dim=-2)                                # [B, H, Dh]
 
@@ -454,7 +482,7 @@ class DropPath(nn.Module):
 
 
 # ============================================================
-# 最近邻插值（channel-first）
+# 最近邻 & 反距离加权插值（channel-first）
 # ============================================================
 def nearest_interpolate(target_pos: torch.Tensor, source_pos: torch.Tensor, source_feat: torch.Tensor) -> torch.Tensor:
     """
@@ -467,15 +495,36 @@ def nearest_interpolate(target_pos: torch.Tensor, source_pos: torch.Tensor, sour
       out: [B, C, Nt]
     """
     B, _, Nt = target_pos.shape
-    _, _, Ns = source_pos.shape
-    device = target_pos.device
-
     # [B,Nt,Ns]
     dist2 = torch.cdist(target_pos.transpose(1, 2).contiguous(), source_pos.transpose(1, 2).contiguous(), p=2)
     nn_idx = dist2.topk(k=1, largest=False)[1].squeeze(-1)  # [B, Nt]
+    batch_idx = torch.arange(B, device=target_pos.device).view(B, 1).expand(B, Nt)
+    out = source_feat[batch_idx, :, nn_idx]                  # [B, C, Nt]
+    return out
 
-    batch_idx = torch.arange(B, device=device).view(B, 1).expand(B, Nt)
-    out = source_feat[batch_idx, :, nn_idx]  # [B, C, Nt]
+
+def idw_interpolate(target_pos: torch.Tensor, source_pos: torch.Tensor, source_feat: torch.Tensor, k: int = 3, p: float = 2.0, eps: float = 1e-6) -> torch.Tensor:
+    """
+    反距离加权（IDW）插值：对 target 的每个点，从 source 选 K 个近邻，按 1/d^p 加权平均。
+    输入:
+      target_pos: [B, 3, Nt]
+      source_pos: [B, 3, Ns]
+      source_feat:[B, C, Ns]
+    输出:
+      out: [B, C, Nt]
+    """
+    B, _, Nt = target_pos.shape
+    # [B,Nt,Ns]
+    dist = torch.cdist(target_pos.transpose(1, 2).contiguous(), source_pos.transpose(1, 2).contiguous(), p=2).clamp_min(eps)
+    knn_d, knn_idx = dist.topk(k=min(k, dist.shape[-1]), largest=False)   # [B,Nt,k]
+    # gather feats: [B,C,Ns] -> [B,C,Nt,k]
+    C = source_feat.shape[1]
+    idx_expand = knn_idx.unsqueeze(1).expand(B, C, Nt, knn_d.shape[-1])
+    feat_expand = source_feat.unsqueeze(2).expand(B, C, Nt, source_feat.shape[-1])
+    neigh_feat = torch.take_along_dim(feat_expand, idx_expand, dim=3)     # [B,C,Nt,k]
+    w = (1.0 / (knn_d ** p)).unsqueeze(1)                                  # [B,1,Nt,k]
+    w = w / (w.sum(dim=-1, keepdim=True) + eps)
+    out = (neigh_feat * w).sum(dim=-1)                                     # [B,C,Nt]
     return out
 
 

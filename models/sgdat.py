@@ -7,12 +7,12 @@ import torch.nn.functional as F
 try:
     from .modules_sgdat import (
         ChannelCCC, LinearSpatialGVA, DropPath, DynamicRadiusChannelFusion,
-        nearest_interpolate, SemanticGuidedGate
+        nearest_interpolate, idw_interpolate, SemanticGuidedGate
     )
 except Exception:
     from modules_sgdat import (
         ChannelCCC, LinearSpatialGVA, DropPath, DynamicRadiusChannelFusion,
-        nearest_interpolate, SemanticGuidedGate
+        nearest_interpolate, idw_interpolate, SemanticGuidedGate
     )
 
 
@@ -237,13 +237,15 @@ class SGDAT(nn.Module):
             self.ccc_512 = nn.Identity()
             self.ccc_128 = nn.Identity()
 
-        # 动态邻域 - 通道融合
+        # 动态邻域 - 通道融合（内部已升级为密度自适应）
         if self.use_dynamic_fusion:
             self.dyn512 = DynamicRadiusChannelFusion(
-                c_in=base_dim, c_hidden=base_dim, c_out=base_dim, k=self.dyn_neighbors, tau=self.dyn_tau
+                c_in=base_dim, c_hidden=base_dim, c_out=base_dim,
+                k=self.dyn_neighbors, tau=self.dyn_tau, k0=8, alpha=1.5, k_max=max(self.dyn_neighbors, 32)
             )
             self.dyn128 = DynamicRadiusChannelFusion(
-                c_in=base_dim * 2, c_hidden=base_dim * 2, c_out=base_dim * 2, k=self.dyn_neighbors, tau=self.dyn_tau
+                c_in=base_dim * 2, c_hidden=base_dim * 2, c_out=base_dim * 2,
+                k=self.dyn_neighbors, tau=self.dyn_tau, k0=8, alpha=1.5, k_max=max(self.dyn_neighbors, 32)
             )
         else:
             self.dyn512 = None
@@ -265,9 +267,9 @@ class SGDAT(nn.Module):
 
         # 语义引导门控
         if self.use_semantic_guided_fusion:
-            self.sem128_head = nn.Conv1d(base_dim * 2, num_classes, kernel_size=1, bias=True)
-            self.sem_gate_512 = SemanticGuidedGate(num_classes)
-            self.sem_gate_N   = SemanticGuidedGate(num_classes)
+            self.sem128_head = nn.Conv1d(base_dim * 2, self.num_classes, kernel_size=1, bias=True)
+            self.sem_gate_512 = SemanticGuidedGate(self.num_classes)
+            self.sem_gate_N   = SemanticGuidedGate(self.num_classes)
         else:
             self.sem128_head = None
             self.sem_gate_512 = None
@@ -295,7 +297,11 @@ class SGDAT(nn.Module):
         self.branch_dp1 = DropPath(self.droppath_prob) if self.droppath_prob > 0 else nn.Identity()
         self.branch_dp2 = DropPath(self.droppath_prob) if self.droppath_prob > 0 else nn.Identity()
 
-        self.head = nn.Conv1d(base_dim * 2, num_classes, kernel_size=1)
+        self.head = nn.Conv1d(base_dim * 2, self.num_classes, kernel_size=1)
+
+        # 上采样后的小型 1x1 refine（用于 IDW/NN 后再适配）
+        self.up_refine_512 = nn.Conv1d(base_dim * 2, base_dim * 2, kernel_size=1, bias=False)
+        self.up_refine_N   = nn.Conv1d(base_dim * 2, base_dim * 2, kernel_size=1, bias=False)
 
         self.apply(self._init_stable)
 
@@ -358,10 +364,11 @@ class SGDAT(nn.Module):
         return y.permute(0, 2, 1).contiguous()       # (B,N,C)
 
     # ---------- 前向 ----------
-    def forward(self, points):
+    def forward(self, points, return_aux: bool = False):
         """
         points: (B, N, 9) -> [xyz(0:3), rgb(3:6), normal(6:9)]
         return: logits (B, N, num_classes)
+                若 return_aux=True, 还返回 {'sem128_logits': (B,K,128), 'idx_128': (B,128)}
         """
         B, N, C = points.shape
         assert C == 9, f"Expect input features 9 (xyz+rgb+normal), but got {C}"
@@ -420,7 +427,7 @@ class SGDAT(nn.Module):
         if self.use_semantic_guided_fusion and self.sem128_head is not None:
             # 注意 sem128_head 期望 [B,C,N]，故先转置
             sem128_logits = self.sem128_head(feat_128.permute(0, 2, 1).contiguous())  # (B,K,128)
-            # 门控到 512、N 两个尺度（nearest_interpolate 为 channel-first）
+            # 门控到 512、N 两个尺度（插值在 channel-first 接口）
             gate512 = self.sem_gate_512(
                 sem_logits=sem128_logits,
                 source_pos=xyz_128.permute(0, 2, 1).contiguous(),
@@ -432,6 +439,7 @@ class SGDAT(nn.Module):
                 target_pos=xyz_normed.permute(0, 2, 1).contiguous()
             )  # (B,1,N)
         else:
+            sem128_logits = None
             gate512 = None
             gateN = None
 
@@ -443,11 +451,12 @@ class SGDAT(nn.Module):
                       f"out2 shape: {feat_128.shape}, NaN={int(n_nan2)}, Inf={int(torch.isinf(feat_128).any().item())}")
 
         # ---------- Decoder: 128 -> 512 ----------
-        # 将 128 特征上采样到 512（channel-first接口）
-        up128_to_512_cf = nearest_interpolate(
+        # 将 128 特征上采样到 512（改为 IDW；如需最近邻可切回 nearest_interpolate）
+        up128_to_512_cf = idw_interpolate(
             target_pos=xyz_512.permute(0, 2, 1).contiguous(),
             source_pos=xyz_128.permute(0, 2, 1).contiguous(),
-            source_feat=feat_128.permute(0, 2, 1).contiguous()
+            source_feat=feat_128.permute(0, 2, 1).contiguous(),
+            k=3, p=2.0
         )  # (B,128,512)
         up128_to_512 = up128_to_512_cf.permute(0, 2, 1).contiguous()  # (B,512,128)
 
@@ -456,20 +465,25 @@ class SGDAT(nn.Module):
 
         pos512 = self.pos512(xyz_512)                                   # (B,512,128)
 
+        # 形状断言（防再出错）
+        assert feat_512.shape[:2] == up128_to_512.shape[:2] == pos512.shape[:2], \
+            f"Shape mismatch @512: feat_512 {feat_512.shape}, up128_to_512 {up128_to_512.shape}, pos512 {pos512.shape}"
+
+        # refine & droppath
         up128_to_512 = self.branch_dp1(up128_to_512)
         pos512 = self.branch_dp1(pos512)
-
-        fuse_512 = torch.cat([feat_512, up128_to_512, pos512], dim=-1)  # (B,512,320)
+        # 拼接
+        fuse_512 = torch.cat([feat_512, up128_to_512, pos512], dim=-1)  # (B,512,64+128+128=320)
         fuse_512 = self.up1(fuse_512.permute(0, 2, 1)).permute(0, 2, 1).contiguous()  # (B,512,128)
         fuse_512 = self.up1_refine(fuse_512)
-        # 线性 GVA 采用 [B,C,N] 接口
         fuse_512 = self._apply_channel_first_module(fuse_512, self.gva_512)
 
         # ---------- Decoder: 512 -> N ----------
-        up512_to_N_cf = nearest_interpolate(
+        up512_to_N_cf = idw_interpolate(
             target_pos=xyz_normed.permute(0, 2, 1).contiguous(),
             source_pos=xyz_512.permute(0, 2, 1).contiguous(),
-            source_feat=fuse_512.permute(0, 2, 1).contiguous()
+            source_feat=fuse_512.permute(0, 2, 1).contiguous(),
+            k=3, p=2.0
         )  # (B,128,N)
         up512_to_N = up512_to_N_cf.permute(0, 2, 1).contiguous()  # (B,N,128)
 
@@ -480,6 +494,10 @@ class SGDAT(nn.Module):
 
         if self.use_geom_enhance and geom_emb_N is not None and geom_emb_N.shape[-1] == posN.shape[-1]:
             posN = posN + geom_emb_N
+
+        # 形状断言
+        assert up512_to_N.shape[:2] == feat0.shape[:2] == posN.shape[:2], \
+            f"Shape mismatch @N: up512_to_N {up512_to_N.shape}, feat0 {feat0.shape}, posN {posN.shape}"
 
         up512_to_N = self.branch_dp2(up512_to_N)
         posN = self.branch_dp2(posN)
@@ -500,6 +518,8 @@ class SGDAT(nn.Module):
                       f"min={float(logits.min()) if torch.isfinite(logits).any() else 0.0}, "
                       f"max={float(logits.max()) if torch.isfinite(logits).any() else 0.0}")
 
+        if return_aux and (sem128_logits is not None):
+            return logits, {"sem128_logits": sem128_logits, "idx_128": idx_128}
         return logits
 
     # ---------- 训练便捷接口 ----------
@@ -509,13 +529,18 @@ class SGDAT(nn.Module):
             labels,
             class_weights=None,
             ignore_index=-1,
-            aux_weight=None,
+            aux_weight: float = 0.2,   # 新增：语义引导辅助监督的权重
             reduction='mean',
             label_smoothing: float = 0.0,
             focal_gamma: float = 0.0,
             **kwargs
     ):
-        logits = self.forward(points)  # (B,N,K)
+        # 前向时请求辅助输出
+        out = self.forward(points, return_aux=True)
+        if isinstance(out, tuple):
+            logits, aux = out
+        else:
+            logits, aux = out, None
 
         if torch.isnan(logits).any() or torch.isinf(logits).any():
             print("[NaN Debug] NaN/Inf detected in logits, fixing...")
@@ -547,6 +572,7 @@ class SGDAT(nn.Module):
         else:
             weight = None
 
+        # 主 CE（含可选 label smoothing & focal）
         if label_smoothing and label_smoothing > 0.0:
             eps = float(label_smoothing)
             probs = F.softmax(logits_valid, dim=-1)
@@ -557,7 +583,6 @@ class SGDAT(nn.Module):
         else:
             probs = F.softmax(logits_valid, dim=-1)
             log_probs = F.log_softmax(logits_valid, dim=-1)
-
             n_class = logits_valid.shape[-1]
             true_dist = torch.zeros_like(log_probs)
             true_dist.scatter_(1, labels_valid.unsqueeze(1), 1.0)
@@ -584,7 +609,30 @@ class SGDAT(nn.Module):
         else:
             loss_main = ce
 
-        loss = loss_main if aux_weight is None else loss_main * (1 - aux_weight)
+        # ===== 新增：语义门控的辅助监督（CE@128） =====
+        aux_loss = logits.new_tensor(0.0)
+        if aux is not None and self.use_semantic_guided_fusion and (aux_weight is not None) and aux_weight > 0.0:
+            sem128_logits = aux["sem128_logits"]            # (B,K,128) channel-first
+            idx_128 = aux["idx_128"]                        # (B,128)
+            # 将 GT 标签下采样到 128：直接按 idx_128 索引
+            label_128 = labels.gather(dim=1, index=idx_128) # (B,128)
+            # 忽略 pad
+            valid_128 = label_128 != ignore_index
+            if valid_128.any():
+                sem_logits_valid = sem128_logits.permute(0, 2, 1)[valid_128]  # (M,K)
+                label_128_valid = label_128[valid_128]                        # (M,)
+                if class_weights is not None:
+                    weight_ = sem_logits_valid.new_tensor(class_weights)
+                else:
+                    weight_ = None
+                aux_ce = F.cross_entropy(sem_logits_valid, label_128_valid, weight=weight_, reduction='mean')
+                aux_loss = aux_ce
+
+        # 组合损失（默认 0.2）
+        if aux_loss > 0:
+            loss = (1.0 - float(aux_weight)) * loss_main + float(aux_weight) * aux_loss
+        else:
+            loss = loss_main
 
         if torch.isnan(loss).any() or torch.isinf(loss).any():
             print("[NaN Debug] NaN/Inf detected in final loss, fixing...")

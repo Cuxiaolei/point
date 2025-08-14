@@ -40,29 +40,37 @@ def init_weights(module):
 def main():
     seed_all(42)
     config = Config()
+    config.print_config()
 
     if not os.path.exists(config.DATA_ROOT):
         print(f"[ERROR] 数据集路径不存在: {config.DATA_ROOT}")
         sys.exit(1)
 
-    # 数据集 —— 根据 Config 的开关显式适配到你的 PointCloudDataset
-    # 当 LIMIT_POINTS=False 时，仍然传入 limit_points=False（不会裁剪）
+    # 数据集构造（与 point_cloud_dataset.py 的新增强对齐）
     common_ds_kwargs = dict(
         rotation=config.ROTATION_AUG,
         scale=config.SCALE_AUG,
         noise=config.NOISE_AUG,
-        translate=config.TRANSFORM_AUG,
+        translate=config.TRANSLATE_AUG,
         limit_points=config.LIMIT_POINTS,
         max_points=config.MAX_POINTS,
         normalize=config.INPUT_NORM,
-        color_mode=getattr(config, "COLOR_MODE", "auto"),
-        normal_unit=getattr(config, "NORMAL_UNIT", True),
-        num_classes=None if (config.NUM_CLASSES is None) else config.NUM_CLASSES
+        color_mode=config.COLOR_MODE,
+        normal_unit=config.NORMAL_UNIT,
+        num_classes=config.NUM_CLASSES,
+        point_dropout=config.POINT_DROPOUT_ENABLE,
+        point_dropout_rate=config.POINT_DROPOUT_RATE,
+        cutmix=config.POINTCUTMIX_ENABLE,
+        cutmix_prob=config.POINTCUTMIX_PROB,
+        cutmix_ratio=config.POINTCUTMIX_RATIO,
+        color_jitter=getattr(config, "COLOR_JITTER_ENABLE", False),
+        color_jitter_params=getattr(config, "COLOR_JITTER_PARAMS", None),
+        normal_noise_std=getattr(config, "NORMAL_NOISE_STD", 0.0),
     )
     train_dataset = PointCloudDataset(data_root=config.DATA_ROOT, split="train", **common_ds_kwargs)
-    val_dataset   = PointCloudDataset(data_root=config.DATA_ROOT, split="val",   **common_ds_kwargs)
+    val_dataset = PointCloudDataset(data_root=config.DATA_ROOT, split="val", **common_ds_kwargs)
 
-    # 自动推断类别数（保持原逻辑）
+    # 自动推断类别数
     if config.NUM_CLASSES is None:
         all_labels = []
         for ds in [train_dataset, val_dataset]:
@@ -75,17 +83,17 @@ def main():
         config.NUM_CLASSES = max(all_labels) + 1 if all_labels else 1
     print(f"[INFO] Inferred num_classes = {config.NUM_CLASSES}")
 
-    # 初始化模型（模型会读取 cfg 中的动态邻域/注意力/语义引导等开关）
+    # 初始化模型（cfg=config 以启用动态邻域、语义引导等新功能）
     model = SGDAT(num_classes=config.NUM_CLASSES, cfg=config)
     model.apply(init_weights)
 
-    # 打印参数
+    # 打印参数数量
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"模型总参数: {total_params:,}")
     print(f"可训练参数: {trainable_params:,}")
 
-    # 类别权重（保留你原来的统计方式；Trainer 若未提供会自行回退计算）
+    # 类别权重
     counts = np.zeros(config.NUM_CLASSES, dtype=np.float32)
     for scene in train_dataset.scene_list:
         seg_path = os.path.join(scene, "segment20.npy")
@@ -101,7 +109,7 @@ def main():
     print(f"[Trainer] class counts: {counts}")
     print(f"[Trainer] class_weights: {class_weights}")
 
-    # Trainer
+    # 创建 Trainer
     trainer = Trainer(
         model=model,
         config=config,
