@@ -240,4 +240,7 @@ class PointCloudDataset(Dataset):
 
         pts = torch.from_numpy(pts).float()  # 保证 float32
         lbl = torch.from_numpy(label).long() # 保证 int64
+
+        print(f"[DEBUG] Dataset output points.shape = {pts.shape}")
+        print(f"[DEBUG] First point (xyz/rgb/normal/...): {pts[0]}")
         return pts, lbl
