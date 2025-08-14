@@ -162,6 +162,8 @@ class SGDAT(nn.Module):
         self.logit_temp = logit_temp
         self.debug = debug
 
+        self.reduce_to_64 = nn.Linear(128, 64)
+
         # ---------- stem ----------
         self.stem = nn.Sequential(
             nn.Conv1d(in_dim - 3, base_dim, 1, bias=False),
@@ -472,6 +474,8 @@ class SGDAT(nn.Module):
 
         if self.use_linear_gva:
             up512_to_N = self._safe_clean(up512_to_N)
+            if up512_to_N.shape[-1] != 64:
+                up512_to_N = self.reduce_to_64(up512_to_N)  # 新加的
             self._check_nan("up512_to_N_after_clean", up512_to_N)
             up512_to_N = self._apply_channel_first_module(up512_to_N, self.gva_N)
 
