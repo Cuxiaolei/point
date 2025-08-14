@@ -263,10 +263,23 @@ class Trainer:
         # 记录最佳 val mIoU
         self.best_val_miou = 0.0
 
-        # 计算/设定 class weights（若外部未给）
+        # 计算/设定 class weights
         if self.class_weights is None:
-            self.class_weights = self._compute_class_weights()
+            self.class_weights, counts = self._compute_class_weights()
+        else:
+            # 若外部传入，仅统计一次 counts 用于先验（可选）
+            counts = None
         print(f"[Trainer] class_weights: {self.class_weights}")
+
+        # 用类别先验初始化分类器 bias（一次即可）
+        try:
+            if counts is not None and counts.sum() > 0:
+                priors = (counts / counts.sum()).astype(np.float32)
+                if hasattr(self.model, "set_class_priors"):
+                    self.model.set_class_priors(priors)
+                    print("[Trainer] 已根据训练集频率设置分类器先验 bias。")
+        except Exception as e:
+            print(f"[Trainer] 设置先验失败（忽略不中断）：{e}")
 
         # EMA
         self.ema = ModelEMA(self.model, decay=config.EMA_DECAY) if getattr(config, "EMA_ENABLE", False) else None
@@ -286,9 +299,7 @@ class Trainer:
         self._logits_nan_warned = False
 
     def _compute_class_weights(self):
-        """统计训练集中每类样本数并返回归一化权重张量"""
         counts = np.zeros(self.config.NUM_CLASSES, dtype=np.int64)
-        # 与你原来一致的统计方式（scene_list/segment20.npy）
         for scene in getattr(self.train_dataset, "scene_list", []):
             seg_path = os.path.join(scene, 'segment20.npy')
             if os.path.exists(seg_path):
@@ -302,7 +313,7 @@ class Trainer:
         weights = inv / inv.sum() * float(self.config.NUM_CLASSES)
         weights = np.where(np.isfinite(weights), weights, 1.0)
         tensor_weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
-        return tensor_weights
+        return tensor_weights, counts
 
     @torch.no_grad()
     def _sanitize_batch(self, points, labels):
