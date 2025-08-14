@@ -173,7 +173,18 @@ class SGDAT(nn.Module):
         bn_momentum: float = 0.01,
         # ====== 轻几何增强 ======
         use_geom_enhance: bool = True,
+        # ====== 新增：从 config 导入 ======
+        cfg=None
     ):
+        # 如果传入了 cfg，就用它的属性覆盖同名参数
+        if cfg is not None:
+            for k, v in cfg.__dict__.items():
+                if hasattr(self, k) or k in locals():
+                    locals()[k] = v
+            # num_classes 单独保证取 config 里的
+            if hasattr(cfg, "NUM_CLASSES"):
+                num_classes = cfg.NUM_CLASSES
+
         super().__init__()
         self.num_classes = int(num_classes)
         self.base_dim = int(base_dim)
@@ -240,21 +251,21 @@ class SGDAT(nn.Module):
 
         # 位置/尺度编码
         self.pos512 = SharedMLP1D(3, base_dim * 2, dropout=self.dropout_p,
-                                  bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)   # 3 -> 128
+                                  bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)
         self.posN   = SharedMLP1D(3, base_dim,     dropout=self.dropout_p,
-                                  bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)   # 3 -> 64
+                                  bn_eps=self.bn_eps, bn_momentum=self.bn_momentum)
 
-        # 线性 GVA（在融合后的 512、N 尺度）
+        # 线性 GVA
         if self.use_linear_gva:
-            self.gva_512 = LinearSpatialGVA(dim=base_dim * 2)  # [B,C,N]
+            self.gva_512 = LinearSpatialGVA(dim=base_dim * 2)
             self.gva_N   = LinearSpatialGVA(dim=base_dim * 2)
         else:
             self.gva_512 = nn.Identity()
             self.gva_N   = nn.Identity()
 
-        # 语义引导门控（SGF）
+        # 语义引导门控
         if self.use_semantic_guided_fusion:
-            self.sem128_head = nn.Conv1d(base_dim * 2, num_classes, kernel_size=1, bias=True)  # 输入 [B,128,128]
+            self.sem128_head = nn.Conv1d(base_dim * 2, num_classes, kernel_size=1, bias=True)
             self.sem_gate_512 = SemanticGuidedGate(num_classes)
             self.sem_gate_N   = SemanticGuidedGate(num_classes)
         else:
@@ -263,7 +274,6 @@ class SGDAT(nn.Module):
             self.sem_gate_N = None
 
         # ---------- Decoder ----------
-        # 512 融合： [feat_512(64) + up128(128) + pos512(128)] -> 128
         self.up1 = nn.Sequential(
             nn.Conv1d(base_dim + base_dim * 2 + base_dim * 2, base_dim * 2, 1, bias=False),
             nn.BatchNorm1d(base_dim * 2, eps=self.bn_eps, momentum=self.bn_momentum),
@@ -273,7 +283,6 @@ class SGDAT(nn.Module):
         self.up1_refine = ResMLP1D(base_dim * 2, base_dim * 2, bn_eps=self.bn_eps,
                                    bn_momentum=self.bn_momentum, use_se=True, dropout=self.dropout_p)
 
-        # N 融合： [up512_to_N(128) + feat0(64) + posN(64)] -> 128
         self.up2 = nn.Sequential(
             nn.Conv1d(base_dim * 2 + base_dim + base_dim, base_dim * 2, 1, bias=False),
             nn.BatchNorm1d(base_dim * 2, eps=self.bn_eps, momentum=self.bn_momentum),
