@@ -25,7 +25,9 @@ class Config:
 
     # ================== 数据路径与数据集 ==================
     # 根目录下期望存在 train/val 分割索引或你自己的扫描列表逻辑
-    DATA_ROOT = "./data"
+    DATA_ROOT = "/root/my/point/data/tower"
+    TRAIN_DIR = os.path.join(DATA_ROOT, "train")
+    VAL_DIR = os.path.join(DATA_ROOT, "val")
     TRAIN_LIST = None                   # 如使用 txt 索引，可在 DataSet 内读取
     VAL_LIST = None
 
