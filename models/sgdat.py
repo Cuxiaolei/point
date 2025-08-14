@@ -267,14 +267,13 @@ class SGDAT(nn.Module):
         # ===== add: 对齐 gva_N 输入通道 (128 -> 64) =====
         self.align_gva_in = nn.Linear(base_dim * 2, base_dim, bias=False)
 
-        # ===== add: 简单的 NaN/Inf 清理工具 =====
-        def _safe_clean(self, x, clip_val=1e4):
-            # 将 NaN 置 0，将 Inf 截断
-            x = torch.nan_to_num(x, nan=0.0, posinf=clip_val, neginf=-clip_val)
-            return x
-
         self.apply(self._init_stable)
 
+    # ===== add: 简单的 NaN/Inf 清理工具 =====
+    def _safe_clean(self, x, clip_val=1e4):
+        # 将 NaN 置 0，将 Inf 截断
+        x = torch.nan_to_num(x, nan=0.0, posinf=clip_val, neginf=-clip_val)
+        return x
     # ---------- 初始化 ----------
     @staticmethod
     def _init_stable(m: nn.Module):
