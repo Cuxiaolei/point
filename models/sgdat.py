@@ -480,6 +480,9 @@ class SGDAT(nn.Module):
         posN = self.posN(xyz_normed)                                     # (B,N,64)
 
         if self.use_linear_gva:
+            print(f"[DEBUG] Before gva_N: up512_to_N.shape = {up512_to_N.shape}")
+            if up512_to_N.numel() > 0:
+                print(f"[DEBUG] Sample up512_to_N[0,0,:10] = {up512_to_N[0, 0, :10]}")
             up512_to_N = self._apply_channel_first_module(up512_to_N, self.gva_N)
 
         fuse_N = torch.cat([up512_to_N, feat0, posN], dim=-1)            # (B,N,256)
