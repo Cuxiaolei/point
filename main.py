@@ -84,7 +84,23 @@ def main():
     print(f"[INFO] Inferred num_classes = {config.NUM_CLASSES}")
 
     # 初始化模型（cfg=config 以启用动态邻域、语义引导等新功能）
-    model = SGDAT(num_classes=config.NUM_CLASSES, cfg=config)
+    model = SGDAT(
+        in_dim=config.IN_DIM,
+        base_dim=config.base_dim,
+        num_classes=config.NUM_CLASSES,
+        bn_eps=config.bn_eps,
+        bn_momentum=config.bn_momentum,
+        dropout_p=config.dropout_p,
+        use_channel_ccc=config.use_channel_ccc,
+        use_linear_gva=config.use_linear_gva,
+        use_dynamic_fusion=config.use_dynamic_fusion,
+        use_semantic_guided_fusion=config.use_semantic_guided_fusion,
+        gva_lin_embed=config.GVA_LIN_EMBED,
+        dyn_neighbors=config.dyn_neighbors,
+        dyn_tau=config.dyn_tau,
+        logit_temp=config.logit_temp,
+        debug=config.DEBUG
+    )
     model.apply(init_weights)
 
     # 打印参数数量

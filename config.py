@@ -133,6 +133,10 @@ class Config:
     SEED = 42
     DETERMINISTIC = False
 
+    IN_DIM = 9
+    GVA_LIN_EMBED = 64
+    DEBUG = False
+
     def __init__(self):
         # 统一种子 & 可重复性
         try:
