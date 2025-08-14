@@ -221,11 +221,12 @@ class DynamicRadiusChannelFusion(nn.Module):
 
 
 # ------------------------------------------------------------
-# 轻量多头注意力（全局）
+# 轻量多头注意力（原版，全局）
 # ------------------------------------------------------------
 class MultiHeadSelfAttention1D(nn.Module):
     """
     多头自注意力（简化版），输入为 [B, C, N]，输出同形状。
+    注意：该实现为标准 Softmax(QK^T) 的 O(N^2) 复杂度，仅保留以兼容历史。
     """
     def __init__(
         self,
@@ -274,9 +275,84 @@ class MultiHeadSelfAttention1D(nn.Module):
         return out
 
 
+# ------------------------------------------------------------
+# 线性多头注意力（O(N) 复杂度，全局）
+# ------------------------------------------------------------
+class LinearMultiHeadSelfAttention1D(nn.Module):
+    """
+    线性复杂度多头注意力（Performer 风格非负核 trick）：
+        phi(x) = elu(x) + 1  （逐元素正映射）
+        out_i = (phi(q_i) @ (K^T V)) / (phi(q_i) @ sum_j phi(k_j))
+
+    输入/输出: [B, C, N] -> [B, C, N]
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 4,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,  # 占位，接口兼容
+        proj_drop: float = 0.0,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        assert dim % num_heads == 0, "dim 必须能被 num_heads 整除"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.eps = eps
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop) if proj_drop > 1e-6 else nn.Identity()
+
+        self.apply(init_linear)
+
+    @staticmethod
+    def _phi(x: torch.Tensor) -> torch.Tensor:
+        # 非负特征映射，避免 softmax 显存开销；保持数值稳定
+        return F.elu(x, inplace=False) + 1.0
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, N] -> [B, N, C]
+        x_ = x.transpose(1, 2).contiguous()
+        b, n, c = x_.shape
+
+        qkv = self.qkv(x_)                          # [B, N, 3C]
+        q, k, v = qkv.chunk(3, dim=-1)              # [B, N, C] * 3
+
+        # [B, H, N, Dh]
+        q = q.view(b, n, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        k = k.view(b, n, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        v = v.view(b, n, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+        # 线性核映射
+        q_phi = self._phi(q)                         # [B, H, N, Dh]
+        k_phi = self._phi(k)                         # [B, H, N, Dh]
+
+        # 预计算项：
+        # S = K^T V  -> [B, H, Dh, Dh]
+        # k_sum = sum_j K_j -> [B, H, Dh]
+        # 注意：全部是 O(N * Dh^2) / O(N * Dh)
+        S = torch.matmul(k_phi.transpose(-2, -1), v)            # [B, H, Dh, Dh]
+        k_sum = k_phi.sum(dim=-2)                                # [B, H, Dh]
+
+        # 分子：Q * S   -> [B, H, N, Dh]
+        numerator = torch.matmul(q_phi, S)                       # [B, H, N, Dh]
+        # 分母：<Q, sum K>  -> [B, H, N]
+        denominator = torch.einsum('bhnd,bhd->bhn', q_phi, k_sum).unsqueeze(-1)  # [B, H, N, 1]
+        denominator = denominator + self.eps
+
+        out = numerator / denominator                            # [B, H, N, Dh]
+        out = out.transpose(1, 2).contiguous().view(b, n, c)     # [B, N, C]
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        out = out.transpose(1, 2).contiguous()                   # [B, C, N]
+        return out
+
+
 class LinearSpatialGVA(nn.Module):
     """
-    兼容原名的全局注意力模块（实现为多头注意力 + 前馈 MLP + 残差）
+    兼容原名的全局注意力模块（改为线性注意力 + 前馈 MLP + 残差）
     输入/输出: [B, C, N]
     """
     def __init__(
@@ -291,9 +367,11 @@ class LinearSpatialGVA(nn.Module):
         super().__init__()
         hidden = int(dim * mlp_ratio)
 
-        self.attn = MultiHeadSelfAttention1D(
+        # 将注意力替换为 O(N) 的线性版本，接口保持一致
+        self.attn = LinearMultiHeadSelfAttention1D(
             dim=dim,
             num_heads=num_heads,
+            qkv_bias=True,
             attn_drop=attn_drop,
             proj_drop=proj_drop,
         )
