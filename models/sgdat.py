@@ -327,18 +327,17 @@ class SGDAT(nn.Module):
         out_bnC = out_cf.permute(0, 2, 1).contiguous()
         return out_bnC
 
-    def _check_nan(self, name, tensor):
-        """检测张量中的 NaN/Inf 并打印调试信息"""
-        if tensor is None:
-            print(f"[DEBUG] {name}: None")
+    def _check_nan(self, tensor, name):
+        if not torch.is_tensor(tensor):
+            print(f"[DEBUG] {name}: Not a tensor! Got type={type(tensor)}")
             return
         nan_count = torch.isnan(tensor).sum().item()
         inf_count = torch.isinf(tensor).sum().item()
         if nan_count > 0 or inf_count > 0:
-            print(f"[ALERT] {name} has NaN={nan_count}, Inf={inf_count}, shape={tensor.shape}")
-            print(f"[ALERT] Sample from {name}: {tensor.view(-1)[:10]}")
+            print(f"[DEBUG] {name}: shape={tuple(tensor.shape)}, NaN={nan_count}, Inf={inf_count}")
+            print(f"[DEBUG] Sample {name}: {tensor.view(-1)[:5]}")
         else:
-            print(f"[OK] {name}: no NaN/Inf, shape={tensor.shape}")
+            print(f"[DEBUG] {name}: OK, shape={tuple(tensor.shape)}")
 
     def forward(self, points, return_aux=False):
         """
