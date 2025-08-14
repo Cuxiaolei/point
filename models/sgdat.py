@@ -349,18 +349,26 @@ class SGDAT(nn.Module):
         rgb_diff = rgb_512 - rgb_512.mean(dim=1, keepdim=True)  # (B,512,3)
         norm_diff = norm_512 - norm_512.mean(dim=1, keepdim=True)  # (B,512,3)
 
-        # 拼接几何特征（总 10 维）
+        # 颜色相似度（cosine）
+        rgb_cos = F.cosine_similarity(rgb_512, rgb_512.mean(dim=1, keepdim=True), dim=-1, eps=1e-6).unsqueeze(-1)
+
+        # 法向相似度（cosine）
+        norm_cos = F.cosine_similarity(norm_512, norm_512.mean(dim=1, keepdim=True), dim=-1, eps=1e-6).unsqueeze(-1)
+
         geom_512 = torch.cat([
-            xyz_512,  # 3 维：局部 xyz
-            torch.norm(xyz_512, dim=-1, keepdim=True),  # 1 维：欧氏距离
-            torch.mean(torch.abs(xyz_512 - xyz_512.mean(dim=1, keepdim=True)), dim=-1, keepdim=True),  # 1 维：偏移绝对值均值
-            torch.norm(rgb_diff, dim=-1, keepdim=True),  # 1 维：颜色差幅度
-            torch.norm(norm_diff, dim=-1, keepdim=True),  # 1 维：法向差幅度
-            torch.zeros_like(xyz_512[..., :1])  # 1 维：占位（可替换为密度等）
+            xyz_512,  # 3
+            torch.norm(xyz_512, dim=-1, keepdim=True),  # 1
+            torch.mean(torch.abs(xyz_512 - xyz_512.mean(dim=1, keepdim=True)), dim=-1, keepdim=True),  # 1
+            torch.norm(rgb_diff, dim=-1, keepdim=True),  # 1
+            torch.norm(norm_diff, dim=-1, keepdim=True),  # 1
+            rgb_cos,  # 1
+            norm_cos,  # 1
+            torch.zeros_like(xyz_512[..., :1])  # 1
         ], dim=-1)  # [B,512,10]
 
         print(f"[DEBUG] geom_512.shape = {geom_512.shape}")
         print(f"[DEBUG] geom_512 sample[0, :5] =\n{geom_512[0, :5]}")
+
         if self.use_geom_enhance:
             geom_emb_512 = self.geom_embed_512(geom_512)                   # (B,512,base_dim//2)
             enc_512_in = torch.cat([xyz_512, feat0_512, geom_emb_512], dim=-1)
