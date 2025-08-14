@@ -366,9 +366,6 @@ class SGDAT(nn.Module):
             torch.zeros_like(xyz_512[..., :1])  # 1
         ], dim=-1)  # [B,512,10]
 
-        print(f"[DEBUG] geom_512.shape = {geom_512.shape}")
-        print(f"[DEBUG] geom_512 sample[0, :5] =\n{geom_512[0, :5]}")
-
         if self.use_geom_enhance:
             geom_emb_512 = self.geom_embed_512(geom_512)                   # (B,512,base_dim//2)
             enc_512_in = torch.cat([xyz_512, feat0_512, geom_emb_512], dim=-1)
