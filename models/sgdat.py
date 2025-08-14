@@ -327,6 +327,19 @@ class SGDAT(nn.Module):
         out_bnC = out_cf.permute(0, 2, 1).contiguous()
         return out_bnC
 
+    def _check_nan(self, name, tensor):
+        """检测张量中的 NaN/Inf 并打印调试信息"""
+        if tensor is None:
+            print(f"[DEBUG] {name}: None")
+            return
+        nan_count = torch.isnan(tensor).sum().item()
+        inf_count = torch.isinf(tensor).sum().item()
+        if nan_count > 0 or inf_count > 0:
+            print(f"[ALERT] {name} has NaN={nan_count}, Inf={inf_count}, shape={tensor.shape}")
+            print(f"[ALERT] Sample from {name}: {tensor.view(-1)[:10]}")
+        else:
+            print(f"[OK] {name}: no NaN/Inf, shape={tensor.shape}")
+
     def forward(self, points, return_aux=False):
         """
         points: [B, N, in_dim], in_dim=9 -> xyz(3) + rgb(3) + normal(3)
@@ -335,7 +348,7 @@ class SGDAT(nn.Module):
         xyz = points[:, :, :3].contiguous()
         feat0 = points[:, :, 3:].contiguous()  # (B,N,6)
 
-        # 归一化坐标（作为位置编码输入）
+        # 归一化坐标
         center = xyz.mean(dim=1, keepdim=True)
         xyz_normed = xyz - center
         scale = torch.clamp(xyz_normed.norm(dim=-1).max(dim=1)[0].view(B, 1, 1), min=1e-6)
@@ -343,190 +356,128 @@ class SGDAT(nn.Module):
 
         # stem
         feat0_cf = feat0.permute(0, 2, 1).contiguous()  # [B,6,N]
-        stem = self.stem(feat0_cf)                      # [B,64,N]
-        feat0_64 = stem.permute(0, 2, 1).contiguous()   # [B,N,64]
+        stem = self.stem(feat0_cf)  # [B,64,N]
+        feat0_64 = stem.permute(0, 2, 1).contiguous()  # [B,N,64]
+        self._check_nan("stem_out", feat0_64)
 
         # 下采样到 512
         xyz_512, feat0_512, idx_512 = self._sample_and_gather(xyz_normed, feat0_64, npoint=512)
 
-        # 取下采样后的 rgb 与 normal
         rgb_512 = batched_index_points(points[:, :, 3:6], idx_512)  # (B,512,3)
         norm_512 = batched_index_points(points[:, :, 6:9], idx_512)  # (B,512,3)
 
-        # 颜色差和法向差（相对均值）
         rgb_diff = rgb_512 - rgb_512.mean(dim=1, keepdim=True)  # (B,512,3)
         norm_diff = norm_512 - norm_512.mean(dim=1, keepdim=True)  # (B,512,3)
 
-        # 颜色相似度（cosine）
         rgb_cos = F.cosine_similarity(rgb_512, rgb_512.mean(dim=1, keepdim=True), dim=-1, eps=1e-6).unsqueeze(-1)
-
-        # 法向相似度（cosine）
         norm_cos = F.cosine_similarity(norm_512, norm_512.mean(dim=1, keepdim=True), dim=-1, eps=1e-6).unsqueeze(-1)
 
         geom_512 = torch.cat([
-            xyz_512,  # 3
-            torch.norm(xyz_512, dim=-1, keepdim=True),  # 1
-            torch.mean(torch.abs(xyz_512 - xyz_512.mean(dim=1, keepdim=True)), dim=-1, keepdim=True),  # 1
-            torch.norm(rgb_diff, dim=-1, keepdim=True),  # 1
-            torch.norm(norm_diff, dim=-1, keepdim=True),  # 1
-            rgb_cos,  # 1
-            norm_cos,  # 1
-            torch.zeros_like(xyz_512[..., :1])  # 1
+            xyz_512,
+            torch.norm(xyz_512, dim=-1, keepdim=True),
+            torch.mean(torch.abs(xyz_512 - xyz_512.mean(dim=1, keepdim=True)), dim=-1, keepdim=True),
+            torch.norm(rgb_diff, dim=-1, keepdim=True),
+            torch.norm(norm_diff, dim=-1, keepdim=True),
+            rgb_cos,
+            norm_cos,
+            torch.zeros_like(xyz_512[..., :1])
         ], dim=-1)  # [B,512,10]
 
         if self.use_geom_enhance:
-            geom_emb_512 = self.geom_embed_512(geom_512)                   # (B,512,base_dim//2)
+            geom_emb_512 = self.geom_embed_512(geom_512)
             enc_512_in = torch.cat([xyz_512, feat0_512, geom_emb_512], dim=-1)
         else:
             enc_512_in = torch.cat([xyz_512, feat0_512], dim=-1)
-        feat_512 = self.enc512(enc_512_in)                                 # (B,512,64)
+        feat_512 = self.enc512(enc_512_in)
+        self._check_nan("enc512_out", feat_512)
 
-        # —— 动态邻域-通道融合 @512
         if self.use_dynamic_fusion and self.dyn512 is not None:
             feat_512 = feat_512 + self._apply_channel_first_module_with_pos(feat_512, xyz_512, self.dyn512)
+        self._check_nan("dyn512_out", feat_512)
 
-        # 通道注意力 @512
-        feat_512 = self._apply_channel_first_module(feat_512, self.ccc_512)  # (B,512,64)
+        feat_512 = self._apply_channel_first_module(feat_512, self.ccc_512)
 
-        # 再下采样到 128
-        xyz_128, feat_512_128, idx_128 = self._sample_and_gather(xyz_512, feat_512, npoint=128)  # (B,128,3),(B,128,64)
+        xyz_128, feat_512_128, idx_128 = self._sample_and_gather(xyz_512, feat_512, npoint=128)
         enc_128_in = torch.cat([xyz_128, feat_512_128], dim=-1)
-        feat_128 = self.enc128(enc_128_in)                       # (B,128,128)
+        feat_128 = self.enc128(enc_128_in)
+        self._check_nan("enc128_out", feat_128)
 
-        # —— 动态邻域-通道融合 @128
         if self.use_dynamic_fusion and self.dyn128 is not None:
             feat_128 = feat_128 + self._apply_channel_first_module_with_pos(feat_128, xyz_128, self.dyn128)
+        self._check_nan("dyn128_out", feat_128)
 
-        # 通道注意力 @128
-        feat_128 = self._apply_channel_first_module(feat_128, self.ccc_128)  # (B,128,128)
+        feat_128 = self._apply_channel_first_module(feat_128, self.ccc_128)
 
-        # ===== 语义引导先验（在 128 尺度形成） =====
+        # 语义引导
         gate512 = gateN = None
         sem128_logits = None
         if self.use_semantic_guided_fusion and self.sem128_head is not None:
-            sem128_logits = self.sem128_head(feat_128.permute(0, 2, 1).contiguous())  # (B,K,128)
+            sem128_logits = self.sem128_head(feat_128.permute(0, 2, 1).contiguous())
             gate512 = self.gate_to_512(sem128_logits, source_pos=xyz_128.permute(0, 2, 1).contiguous(),
-                                       target_pos=xyz_512.permute(0, 2, 1).contiguous())  # [B,1,512]
+                                       target_pos=xyz_512.permute(0, 2, 1).contiguous())
             gateN = self.gate_to_N(sem128_logits, source_pos=xyz_128.permute(0, 2, 1).contiguous(),
-                                   target_pos=xyz_normed.permute(0, 2, 1).contiguous())  # [B,1,N]
+                                   target_pos=xyz_normed.permute(0, 2, 1).contiguous())
 
-        # ---------- Decoder: 128 -> 512 ----------
+        # Decoder: 128 -> 512
         up128_to_512_cf = idw_interpolate(
             target_pos=xyz_512.permute(0, 2, 1).contiguous(),
             source_pos=xyz_128.permute(0, 2, 1).contiguous(),
             source_feat=feat_128.permute(0, 2, 1).contiguous(),
             k=3, p=2.0
-        )  # (B,128,512)
-        up128_to_512 = up128_to_512_cf.permute(0, 2, 1).contiguous()  # (B,512,128)
+        )
+        up128_to_512 = up128_to_512_cf.permute(0, 2, 1).contiguous()
 
-        # ====== 修复点 1：对齐 gate512 并显式广播 ======
         if gate512 is not None:
             g512 = gate512
-            if g512.dim() != 3:
-                raise RuntimeError(f"gate512 dim unexpected: {g512.shape}")
-            # 期望 up128_to_512 为 [B,512,128]
             if g512.shape[1] == 1 and g512.shape[2] == up128_to_512.shape[1]:
-                # [B,1,512] -> [B,512,1]
-                g512 = g512.permute(0, 2, 1).contiguous()
-            elif g512.shape[1] == up128_to_512.shape[1] and g512.shape[2] == 1:
-                # 已是 [B,512,1]
-                g512 = g512.contiguous()
-            else:
-                # 兜底：压到通道 1，再校正最后一维
-                g512 = g512.mean(dim=1, keepdim=True)
-                if g512.shape[-1] != up128_to_512.shape[1]:
-                    raise RuntimeError(f"gate512 last dim {g512.shape[-1]} != {up128_to_512.shape[1]}")
                 g512 = g512.permute(0, 2, 1).contiguous()
             up128_to_512 = up128_to_512 * g512.expand_as(up128_to_512)
 
-        pos512 = self.pos512(xyz_512)                                   # (B,512,128)
-
-        # 形状断言（防再出错）
-        assert feat_512.shape[:2] == up128_to_512.shape[:2] == pos512.shape[:2], \
-            f"Shape mismatch @512: feat_512 {feat_512.shape}, up128_to_512 {up128_to_512.shape}, pos512 {pos512.shape}"
-
-        # refine & droppath
+        pos512 = self.pos512(xyz_512)
         up128_to_512 = self.branch_dp1(up128_to_512)
         pos512 = self.branch_dp1(pos512)
 
-        fuse_512 = torch.cat([feat_512, up128_to_512, pos512], dim=-1)   # (B,512,64+128+128=320)
-        fuse_512 = self.up1(fuse_512.permute(0, 2, 1)).permute(0, 2, 1).contiguous()  # (B,512,128)
+        fuse_512 = torch.cat([feat_512, up128_to_512, pos512], dim=-1)
+        fuse_512 = self.up1(fuse_512.permute(0, 2, 1)).permute(0, 2, 1).contiguous()
         fuse_512 = self.up1_refine(fuse_512)
         fuse_512 = self._apply_channel_first_module(fuse_512, self.gva_512)
 
-        # ---------- Decoder: 512 -> N ----------
+        # Decoder: 512 -> N
         up512_to_N_cf = idw_interpolate(
             target_pos=xyz_normed.permute(0, 2, 1).contiguous(),
             source_pos=xyz_512.permute(0, 2, 1).contiguous(),
             source_feat=fuse_512.permute(0, 2, 1).contiguous(),
             k=3, p=2.0
-        )  # (B,128,N)
-        up512_to_N = up512_to_N_cf.permute(0, 2, 1).contiguous()  # (B,N,128)
+        )
+        up512_to_N = up512_to_N_cf.permute(0, 2, 1).contiguous()
+        self._check_nan("up512_to_N_before_gva", up512_to_N)
 
-        # ====== 修复点 2：对齐 gateN 并显式广播 ======
         if gateN is not None:
             gN = gateN
-            if gN.dim() != 3:
-                raise RuntimeError(f"gateN dim unexpected: {gN.shape}")
-            # 期望 up512_to_N 为 [B,N,128]
             if gN.shape[1] == 1 and gN.shape[2] == up512_to_N.shape[1]:
-                # [B,1,N] -> [B,N,1]
-                gN = gN.permute(0, 2, 1).contiguous()
-            elif gN.shape[1] == up512_to_N.shape[1] and gN.shape[2] == 1:
-                # 已是 [B,N,1]
-                gN = gN.contiguous()
-            else:
-                gN = gN.mean(dim=1, keepdim=True)
-                if gN.shape[-1] != up512_to_N.shape[1]:
-                    raise RuntimeError(f"gateN last dim {gN.shape[-1]} != {up512_to_N.shape[1]}")
                 gN = gN.permute(0, 2, 1).contiguous()
             up512_to_N = up512_to_N * gN.expand_as(up512_to_N)
 
-        posN = self.posN(xyz_normed)                                     # (B,N,64)
+        posN = self.posN(xyz_normed)
 
         if self.use_linear_gva:
-            # ===== debug: 进入 gva_N 之前的形状与数值 =====
-            print(f"[DEBUG] Before gva_N: up512_to_N.shape = {up512_to_N.shape}")
-            if up512_to_N.numel() > 0:
-                # 看看有没有 NaN / Inf
-                num_nan = torch.isnan(up512_to_N).sum().item()
-                num_inf = torch.isinf(up512_to_N).sum().item()
-                print(f"[DEBUG] up512_to_N NaN count = {num_nan}, Inf count = {num_inf}")
-                print(f"[DEBUG] Sample up512_to_N[0,0,:10] = {up512_to_N[0, 0, :10]}")
-
-            # ===== clean: 先把 NaN/Inf 清理掉，避免传染到注意力里 =====
             up512_to_N = self._safe_clean(up512_to_N)
-
-            # 再次给一点样本，确认已无 NaN/Inf
-            if up512_to_N.numel() > 0:
-                num_nan = torch.isnan(up512_to_N).sum().item()
-                num_inf = torch.isinf(up512_to_N).sum().item()
-                print(f"[DEBUG] After clean: NaN count = {num_nan}, Inf count = {num_inf}")
-                print(f"[DEBUG] After clean sample up512_to_N[0,0,:10] = {up512_to_N[0, 0, :10]}")
-
-            # ===== align: 若通道为 128，则对齐到 64 再送入 gva_N =====
-            if up512_to_N.shape[-1] == self.align_gva_in.in_features:
-                up512_to_N = self.align_gva_in(up512_to_N)
-
-            print(f"[DEBUG] Aligned for gva_N: up512_to_N.shape = {up512_to_N.shape}")
-
-            # ===== apply gva_N =====
+            self._check_nan("up512_to_N_after_clean", up512_to_N)
             up512_to_N = self._apply_channel_first_module(up512_to_N, self.gva_N)
 
-        fuse_N = torch.cat([up512_to_N, feat0, posN], dim=-1)            # (B,N,256)
-        fuse_N = self.up2(fuse_N.permute(0, 2, 1)).permute(0, 2, 1).contiguous()  # (B,N,128)
+        fuse_N = torch.cat([up512_to_N, feat0, posN], dim=-1)
+        fuse_N = self.up2(fuse_N.permute(0, 2, 1)).permute(0, 2, 1).contiguous()
         fuse_N = self.up2_refine(fuse_N)
 
-        logits = self.head(fuse_N.permute(0, 2, 1)).permute(0, 2, 1).contiguous()  # (B,N,K)
+        logits = self.head(fuse_N.permute(0, 2, 1)).permute(0, 2, 1).contiguous()
 
         if self.logit_temp and self.logit_temp != 1.0:
             logits = logits / self.logit_temp
 
         if return_aux and (sem128_logits is not None):
-            # 注意：保持你原来 get_loss 依赖的 key 名称
             aux = {
-                "sem128_logits": sem128_logits,     # (B,K,128) channel-first
-                "idx_128": idx_128                  # (B,128)
+                "sem128_logits": sem128_logits,
+                "idx_128": idx_128
             }
             return logits, aux
 
