@@ -347,56 +347,67 @@ class SGDAT(nn.Module):
         B, N, C = points.shape
         xyz = points[:, :, :3].contiguous()
         feat0 = points[:, :, 3:].contiguous()  # (B,N,6)
+        self._check_nan(points, "input_points")
 
-        # 归一化坐标
+        # 归一化坐标（作为位置编码输入）
         center = xyz.mean(dim=1, keepdim=True)
         xyz_normed = xyz - center
         scale = torch.clamp(xyz_normed.norm(dim=-1).max(dim=1)[0].view(B, 1, 1), min=1e-6)
         xyz_normed = xyz_normed / scale
+        self._check_nan(xyz_normed, "xyz_normed")
 
         # stem
         feat0_cf = feat0.permute(0, 2, 1).contiguous()  # [B,6,N]
-        stem = self.stem(feat0_cf)  # [B,64,N]
-        feat0_64 = stem.permute(0, 2, 1).contiguous()  # [B,N,64]
-        self._check_nan("stem_out", feat0_64)
+        stem = self.stem(feat0_cf)                      # [B,64,N]
+        feat0_64 = stem.permute(0, 2, 1).contiguous()   # [B,N,64]
+        self._check_nan(feat0_64, "feat0_64")
 
         # 下采样到 512
         xyz_512, feat0_512, idx_512 = self._sample_and_gather(xyz_normed, feat0_64, npoint=512)
+        self._check_nan(feat0_512, "feat0_512")
 
+        # 取下采样后的 rgb 与 normal
         rgb_512 = batched_index_points(points[:, :, 3:6], idx_512)  # (B,512,3)
         norm_512 = batched_index_points(points[:, :, 6:9], idx_512)  # (B,512,3)
 
+        # 颜色差和法向差（相对均值）
         rgb_diff = rgb_512 - rgb_512.mean(dim=1, keepdim=True)  # (B,512,3)
         norm_diff = norm_512 - norm_512.mean(dim=1, keepdim=True)  # (B,512,3)
 
+        # 颜色相似度（cosine）
         rgb_cos = F.cosine_similarity(rgb_512, rgb_512.mean(dim=1, keepdim=True), dim=-1, eps=1e-6).unsqueeze(-1)
+
+        # 法向相似度（cosine）
         norm_cos = F.cosine_similarity(norm_512, norm_512.mean(dim=1, keepdim=True), dim=-1, eps=1e-6).unsqueeze(-1)
 
         geom_512 = torch.cat([
-            xyz_512,
-            torch.norm(xyz_512, dim=-1, keepdim=True),
-            torch.mean(torch.abs(xyz_512 - xyz_512.mean(dim=1, keepdim=True)), dim=-1, keepdim=True),
-            torch.norm(rgb_diff, dim=-1, keepdim=True),
-            torch.norm(norm_diff, dim=-1, keepdim=True),
-            rgb_cos,
-            norm_cos,
-            torch.zeros_like(xyz_512[..., :1])
+            xyz_512,  # 3
+            torch.norm(xyz_512, dim=-1, keepdim=True),  # 1
+            torch.mean(torch.abs(xyz_512 - xyz_512.mean(dim=1, keepdim=True)), dim=-1, keepdim=True),  # 1
+            torch.norm(rgb_diff, dim=-1, keepdim=True),  # 1
+            torch.norm(norm_diff, dim=-1, keepdim=True),  # 1
+            rgb_cos,  # 1
+            norm_cos,  # 1
+            torch.zeros_like(xyz_512[..., :1])  # 1
         ], dim=-1)  # [B,512,10]
+        self._check_nan(geom_512, "geom_512")
 
         if self.use_geom_enhance:
-            geom_emb_512 = self.geom_embed_512(geom_512)
+            geom_emb_512 = self.geom_embed_512(geom_512)                   # (B,512,base_dim//2)
             enc_512_in = torch.cat([xyz_512, feat0_512, geom_emb_512], dim=-1)
         else:
             enc_512_in = torch.cat([xyz_512, feat0_512], dim=-1)
-        feat_512 = self.enc512(enc_512_in)
-        self._check_nan("enc512_out", feat_512)
+        feat_512 = self.enc512(enc_512_in)                                 # (B,512,64)
+        self._check_nan(feat_512, "feat_512_after_enc")
 
+        # —— 动态邻域-通道融合 @512
         if self.use_dynamic_fusion and self.dyn512 is not None:
             feat_512 = feat_512 + self._apply_channel_first_module_with_pos(feat_512, xyz_512, self.dyn512)
-        self._check_nan("dyn512_out", feat_512)
+            self._check_nan(feat_512, "feat_512_after_dyn")
 
-        feat_512 = self._apply_channel_first_module(feat_512, self.ccc_512)
-
+        # 通道注意力 @512
+        feat_512 = self._apply_channel_first_module(feat_512, self.ccc_512)  # (B,512,64)
+        self._check_nan(feat_512, "feat_512_after_ccc")
         xyz_128, feat_512_128, idx_128 = self._sample_and_gather(xyz_512, feat_512, npoint=128)
         enc_128_in = torch.cat([xyz_128, feat_512_128], dim=-1)
         feat_128 = self.enc128(enc_128_in)
