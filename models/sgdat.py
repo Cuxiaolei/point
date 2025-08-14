@@ -264,6 +264,15 @@ class SGDAT(nn.Module):
             nn.Conv1d(base_dim, num_classes, 1, bias=True)
         )
 
+        # ===== add: 对齐 gva_N 输入通道 (128 -> 64) =====
+        self.align_gva_in = nn.Linear(base_dim * 2, base_dim, bias=False)
+
+        # ===== add: 简单的 NaN/Inf 清理工具 =====
+        def _safe_clean(self, x, clip_val=1e4):
+            # 将 NaN 置 0，将 Inf 截断
+            x = torch.nan_to_num(x, nan=0.0, posinf=clip_val, neginf=-clip_val)
+            return x
+
         self.apply(self._init_stable)
 
     # ---------- 初始化 ----------
@@ -477,9 +486,32 @@ class SGDAT(nn.Module):
         posN = self.posN(xyz_normed)                                     # (B,N,64)
 
         if self.use_linear_gva:
+            # ===== debug: 进入 gva_N 之前的形状与数值 =====
             print(f"[DEBUG] Before gva_N: up512_to_N.shape = {up512_to_N.shape}")
             if up512_to_N.numel() > 0:
+                # 看看有没有 NaN / Inf
+                num_nan = torch.isnan(up512_to_N).sum().item()
+                num_inf = torch.isinf(up512_to_N).sum().item()
+                print(f"[DEBUG] up512_to_N NaN count = {num_nan}, Inf count = {num_inf}")
                 print(f"[DEBUG] Sample up512_to_N[0,0,:10] = {up512_to_N[0, 0, :10]}")
+
+            # ===== clean: 先把 NaN/Inf 清理掉，避免传染到注意力里 =====
+            up512_to_N = self._safe_clean(up512_to_N)
+
+            # 再次给一点样本，确认已无 NaN/Inf
+            if up512_to_N.numel() > 0:
+                num_nan = torch.isnan(up512_to_N).sum().item()
+                num_inf = torch.isinf(up512_to_N).sum().item()
+                print(f"[DEBUG] After clean: NaN count = {num_nan}, Inf count = {num_inf}")
+                print(f"[DEBUG] After clean sample up512_to_N[0,0,:10] = {up512_to_N[0, 0, :10]}")
+
+            # ===== align: 若通道为 128，则对齐到 64 再送入 gva_N =====
+            if up512_to_N.shape[-1] == self.align_gva_in.in_features:
+                up512_to_N = self.align_gva_in(up512_to_N)
+
+            print(f"[DEBUG] Aligned for gva_N: up512_to_N.shape = {up512_to_N.shape}")
+
+            # ===== apply gva_N =====
             up512_to_N = self._apply_channel_first_module(up512_to_N, self.gva_N)
 
         fuse_N = torch.cat([up512_to_N, feat0, posN], dim=-1)            # (B,N,256)
