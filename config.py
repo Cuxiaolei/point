@@ -38,7 +38,7 @@ class Config:
     INPUT_NORM = True                   # 对坐标/颜色做归一化（DataSet 内部实现）
 
     # 采样与点数控制（与 DataLoader 的 collate 对齐）
-    LIMIT_POINTS = 8192                 # 每个样本训练时最多取多少点（-1 表示不裁）
+    LIMIT_POINTS = -1                 # 每个样本训练时最多取多少点（-1 表示不裁）
     MAX_POINTS = 12000                  # 模型内部用于位置嵌入/插值等的上限（与 sgdat 对齐）  # noqa
 
     # 数据增强（与 point_cloud_dataset.py 对齐）

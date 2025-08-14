@@ -163,6 +163,7 @@ class SGDAT(nn.Module):
         self.debug = debug
 
         self.reduce_to_64 = nn.Linear(128, 64)
+        self.align_to_256 = nn.Conv1d(134, 256, 1)
 
         # ---------- stem ----------
         self.stem = nn.Sequential(
@@ -480,6 +481,8 @@ class SGDAT(nn.Module):
             up512_to_N = self._apply_channel_first_module(up512_to_N, self.gva_N)
 
         fuse_N = torch.cat([up512_to_N, feat0, posN], dim=-1)
+        if fuse_N.shape[-1] != 256:
+            fuse_N = self.align_to_256(fuse_N.permute(0, 2, 1)).permute(0, 2, 1)
         fuse_N = self.up2(fuse_N.permute(0, 2, 1)).permute(0, 2, 1).contiguous()
         fuse_N = self.up2_refine(fuse_N)
 
