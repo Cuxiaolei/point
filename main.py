@@ -1,139 +1,112 @@
-import os
-import sys
-import random
-import numpy as np
 import torch
-import torch.backends.cudnn as cudnn
+import numpy as np
+import os
+import collections
 
-from config import Config
-from datasets.point_cloud_dataset import PointCloudDataset
 from models.sgdat import SGDAT
+from datasets.point_cloud_dataset import PointCloudDataset
 from trainer import Trainer
+from config import Config
 
 
-def seed_all(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    cudnn.deterministic = True
-    cudnn.benchmark = False
+def infer_num_classes_from_dataset(train_dataset, val_dataset):
+    """从训练集和验证集联合推断类别数"""
+    all_labels = set()
+    for ds in [train_dataset, val_dataset]:
+        for scene in ds.scene_list:
+            seg_path = os.path.join(scene, 'segment20.npy')
+            if os.path.exists(seg_path):
+                arr = np.load(seg_path)
+                arr = arr[arr >= 0]  # 忽略 pad
+                all_labels.update(arr.tolist())
+    if not all_labels:
+        return 1
+    return max(all_labels) + 1
 
 
-def init_weights(module):
-    if isinstance(module, torch.nn.Conv1d) or isinstance(module, torch.nn.Conv2d):
-        torch.nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-        if module.bias is not None:
-            torch.nn.init.zeros_(module.bias)
-    elif isinstance(module, torch.nn.BatchNorm1d) or isinstance(module, torch.nn.BatchNorm2d):
-        if module.weight is not None:
-            torch.nn.init.ones_(module.weight)
-        if module.bias is not None:
-            torch.nn.init.zeros_(module.bias)
-    elif isinstance(module, torch.nn.Linear):
-        torch.nn.init.xavier_normal_(module.weight)
-        if module.bias is not None:
-            torch.nn.init.zeros_(module.bias)
+def compute_class_weights(train_dataset, num_classes):
+    """根据训练集计算类别权重"""
+    cnt = collections.Counter()
+    for scene in train_dataset.scene_list:
+        seg_path = os.path.join(scene, 'segment20.npy')
+        if os.path.exists(seg_path):
+            arr = np.load(seg_path)
+            arr = arr[arr != -1]
+            cnt.update(arr.tolist())
+
+    counts = np.array([cnt.get(i, 0) for i in range(num_classes)], dtype=np.float32)
+    weights = counts.sum() / (counts + 1e-6)  # 防止除 0
+    weights = weights / (weights.mean() + 1e-12)  # 归一化
+    print(f"[Trainer] class counts: {counts}")
+    print(f"[Trainer] class_weights: {weights}")
+    return torch.tensor(weights, dtype=torch.float32)
 
 
 def main():
-    seed_all(42)
+    torch.manual_seed(42)  # 保证可复现
+
+    # 加载配置
     config = Config()
-    config.print_config()
 
-    if not os.path.exists(config.DATA_ROOT):
-        print(f"[ERROR] 数据集路径不存在: {config.DATA_ROOT}")
-        sys.exit(1)
-
-    # 数据集构造（与 point_cloud_dataset.py 的新增强对齐）
-    common_ds_kwargs = dict(
+    # 数据集（保持你的 PointCloudDataset 的参数签名）
+    train_dataset = PointCloudDataset(
+        config.DATA_ROOT,
+        split="train",
         rotation=config.ROTATION_AUG,
         scale=config.SCALE_AUG,
         noise=config.NOISE_AUG,
-        translate=config.TRANSLATE_AUG,
-        limit_points=config.LIMIT_POINTS,
-        max_points=config.MAX_POINTS,
-        normalize=config.INPUT_NORM,
-        color_mode=config.COLOR_MODE,
-        normal_unit=config.NORMAL_UNIT,
-        num_classes=config.NUM_CLASSES,
-        point_dropout=config.POINT_DROPOUT_ENABLE,
-        point_dropout_rate=config.POINT_DROPOUT_RATE,
-        cutmix=config.POINTCUTMIX_ENABLE,
-        cutmix_prob=config.POINTCUTMIX_PROB,
-        cutmix_ratio=config.POINTCUTMIX_RATIO,
-        color_jitter=getattr(config, "COLOR_JITTER_ENABLE", False),
-        color_jitter_params=getattr(config, "COLOR_JITTER_PARAMS", None),
-        normal_noise_std=getattr(config, "NORMAL_NOISE_STD", 0.0),
+        translate=config.TRANSFORM_AUG,
+        max_points=config.MAX_POINTS if config.LIMIT_POINTS else None
     )
-    train_dataset = PointCloudDataset(data_root=config.DATA_ROOT, split="train", **common_ds_kwargs)
-    val_dataset = PointCloudDataset(data_root=config.DATA_ROOT, split="val", **common_ds_kwargs)
+    val_dataset = PointCloudDataset(
+        config.DATA_ROOT,
+        split="val",
+        rotation=False,
+        scale=False,
+        noise=False,
+        translate=False,
+        max_points=config.MAX_POINTS if config.LIMIT_POINTS else None
+    )
 
-    # 自动推断类别数
-    if config.NUM_CLASSES is None:
-        all_labels = []
-        for ds in [train_dataset, val_dataset]:
-            for scene in ds.scene_list:
-                seg_path = os.path.join(scene, "segment20.npy")
-                if os.path.exists(seg_path):
-                    arr = np.load(seg_path)
-                    arr = arr[arr >= 0]
-                    all_labels.extend(arr.tolist())
-        config.NUM_CLASSES = max(all_labels) + 1 if all_labels else 1
-    print(f"[INFO] Inferred num_classes = {config.NUM_CLASSES}")
+    # 类别数自动推断（仍然会被 config.NUM_CLASSES 覆盖/更新）
+    num_classes = infer_num_classes_from_dataset(train_dataset, val_dataset)
+    print(f"[INFO] Inferred num_classes = {num_classes}")
+    config.NUM_CLASSES = num_classes
 
-    # 初始化模型（cfg=config 以启用动态邻域、语义引导等新功能）
+    # 类别权重
+    class_weights = compute_class_weights(train_dataset, num_classes).to(config.DEVICE)
+
+    # =========================
+    # 初始化模型：所有“反过拟合”参数都从 Config 读取，并显式传入 SGDAT
+    # =========================
+    dropout_p = config.DROPOUT_RATE if getattr(config, "ENABLE_DROPOUT", False) else 0.0
+    droppath_prob = config.DROPPATH_PROB if getattr(config, "ENABLE_DROPPATH", False) else 0.0
+    # 若只提供了一个 FEATURE_DROP_PROB，就对 RGB/Normal 使用同一个概率
+    feat_drop_p = config.FEATURE_DROP_PROB if getattr(config, "ENABLE_FEATURE_DROP", False) else 0.0
+    logit_temp = config.TEMP_FACTOR if getattr(config, "ENABLE_TEMP_SCALING", False) else 1.0
+    use_channel_ccc = getattr(config, "ENABLE_CHANNEL_CCC", False)
+
     model = SGDAT(
-        in_dim=config.IN_DIM,
-        base_dim=config.base_dim,
         num_classes=config.NUM_CLASSES,
-        bn_eps=config.bn_eps,
-        bn_momentum=config.bn_momentum,
-        dropout_p=config.dropout_p,
-        use_channel_ccc=config.use_channel_ccc,
-        use_linear_gva=config.use_linear_gva,
-        use_dynamic_fusion=config.use_dynamic_fusion,
-        use_semantic_guided_fusion=config.use_semantic_guided_fusion,
-        gva_lin_embed=config.GVA_LIN_EMBED,
-        dyn_neighbors=config.dyn_neighbors,
-        dyn_tau=config.dyn_tau,
-        logit_temp=config.logit_temp,
-        debug=config.DEBUG
+        base_dim=64,
+        max_points=config.MAX_POINTS if config.LIMIT_POINTS else None,
+        debug=True,
+        dropout_p=dropout_p,
+        droppath_prob=droppath_prob,
+        drop_rgb_p=feat_drop_p,
+        drop_normal_p=feat_drop_p,
+        logit_temp=logit_temp,
+        use_channel_ccc=use_channel_ccc
     )
-    model.apply(init_weights)
 
-    # 打印参数数量
+    # 打印参数
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"模型总参数: {total_params:,}")
     print(f"可训练参数: {trainable_params:,}")
 
-    # 类别权重
-    counts = np.zeros(config.NUM_CLASSES, dtype=np.float32)
-    for scene in train_dataset.scene_list:
-        seg_path = os.path.join(scene, "segment20.npy")
-        if os.path.exists(seg_path):
-            arr = np.load(seg_path)
-            arr = arr[arr != -1]
-            binc = np.bincount(arr, minlength=config.NUM_CLASSES)
-            counts += binc
-    inv = 1.0 / (counts + 1e-6)
-    weights = inv / inv.sum() * float(config.NUM_CLASSES)
-    weights = np.where(np.isfinite(weights), weights, 1.0)
-    class_weights = torch.tensor(weights, dtype=torch.float32).to(config.DEVICE)
-    print(f"[Trainer] class counts: {counts}")
-    print(f"[Trainer] class_weights: {class_weights}")
-
-    # 创建 Trainer
-    trainer = Trainer(
-        model=model,
-        config=config,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        class_weights=class_weights
-    )
-
+    # 初始化 Trainer（反过拟合策略：如标签平滑与 Focal 在 Trainer/损失处启用）
+    trainer = Trainer(model, config, train_dataset, val_dataset, class_weights=class_weights)
     trainer.train()
 
 
